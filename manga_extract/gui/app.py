@@ -15,7 +15,7 @@ import time
 import traceback
 from dataclasses import replace
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -24,7 +24,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageGrab, ImageTk
 
 from ..detector import ComicTextDetector
-from ..pipeline import MangaExtractor, PageResult
+from ..pipeline import ExtractedLine, MangaExtractor, PageResult
 from ..recognizer import MangaOcrRecognizer
 from ..translation import (
     TARGET_LANGUAGES,
@@ -471,6 +471,14 @@ class MangaExtractApp:
         win.attributes("-topmost", True)
         win.geometry("760x680")
 
+        # 按钮栏先按 bottom 打包：内容超高时被压缩的是最后打包的文本框，
+        # 而不是按钮（否则按钮会被挤成 0 高度，看不见）。
+        actions = ttk.Frame(win)
+        actions.pack(side="bottom", fill="x", pady=(0, 8))
+        ttk.Button(actions, text="编辑…", width=8,
+                   command=lambda: self._open_editor(card, on_saved=render)).pack(side="left", padx=8)
+        ttk.Button(actions, text="关闭", width=8, command=win.destroy).pack(side="right", padx=8)
+
         preview = annotated.copy()
         preview.thumbnail((720, 420))
         photo = ImageTk.PhotoImage(preview)
@@ -479,10 +487,109 @@ class MangaExtractApp:
 
         text = tk.Text(win, wrap="word", height=14)
         text.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        text.insert("1.0", _format_detail(result, card.get("pairs")))
-        text.configure(state="disabled")
 
-        ttk.Button(win, text="关闭", command=win.destroy).pack(pady=(0, 8))
+        def render() -> None:
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            text.insert("1.0", _format_detail(card.get("result"), card.get("pairs")))
+            text.configure(state="disabled")
+
+        render()
+        return win
+
+    def _open_editor(self, card: Dict,
+                     on_saved: Optional[Callable[[], None]] = None) -> Optional[tk.Toplevel]:
+        """Manually proofread the translation or fix mis-recognised text."""
+        result: Optional[PageResult] = card.get("result")
+        if result is None:
+            self._set_status("还没有可编辑的结果")
+            return None
+
+        win = tk.Toplevel(self.root)
+        win.title("手动校对")
+        win.attributes("-topmost", True)
+        win.geometry("780x640")
+        win.transient(self.root)
+
+        # 同详情窗：按钮栏先按 bottom 打包，保证文本块很多时按钮不被挤掉。
+        actions = ttk.Frame(win)
+        actions.pack(side="bottom", fill="x", pady=(10, 10))
+        ttk.Button(actions, text="保存修改", width=10,
+                   command=lambda: save()).pack(side="right", padx=(0, 12))
+        ttk.Button(actions, text="取消", width=8, command=win.destroy).pack(side="right")
+
+        ttk.Label(
+            win, justify="left", foreground="#666", wraplength=740,
+            text="直接修改识别结果（原文）或译文。保存后卡片显示、复制、保存、译文叠图都会用修改后的内容；"
+                 "改过原文的文本块会合并成一行。",
+        ).pack(fill="x", padx=12, pady=(10, 6))
+
+        area = ttk.Frame(win)
+        area.pack(fill="both", expand=True, padx=12)
+        canvas = tk.Canvas(area, highlightthickness=0)
+        vbar = ttk.Scrollbar(area, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vbar.pack(side="right", fill="y")
+        inner = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        def on_wheel(event: "tk.Event") -> None:
+            canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+        canvas.bind("<MouseWheel>", on_wheel)
+        inner.bind("<MouseWheel>", on_wheel)
+
+        targets = {index: target for index, _src, target in (card.get("block_pairs") or [])}
+        rows: List[tuple] = []
+        for index, block in enumerate(result.blocks):
+            x1, y1, x2, y2 = block.xyxy
+            direction = "竖排" if block.vertical else "横排"
+            box = ttk.LabelFrame(inner, text=f"#{index}　{direction}　({x1},{y1})-({x2},{y2})",
+                                 padding=8)
+            box.pack(fill="x", pady=(0, 6))
+            ttk.Label(box, text="原文").grid(row=0, column=0, sticky="nw")
+            src_entry = tk.Text(box, height=_editor_height(block.text), width=56, wrap="word")
+            src_entry.grid(row=0, column=1, sticky="we", padx=(8, 0))
+            if block.text:
+                src_entry.insert("1.0", block.text)
+
+            tgt_entry = None
+            if index in targets:
+                ttk.Label(box, text="译文").grid(row=1, column=0, sticky="nw", pady=(6, 0))
+                tgt_entry = tk.Text(box, height=_editor_height(targets[index]), width=56,
+                                    wrap="word")
+                tgt_entry.grid(row=1, column=1, sticky="we", padx=(8, 0), pady=(6, 0))
+                tgt_entry.insert("1.0", targets[index])
+
+            box.columnconfigure(1, weight=1)
+            rows.append((index, block, src_entry, tgt_entry))
+
+        def save() -> None:
+            for _index, block, src_entry, _tgt in rows:
+                text = src_entry.get("1.0", "end").strip()
+                if text != block.text:
+                    _rewrite_block_text(block, text)
+
+            if card.get("block_pairs"):
+                # 与自动翻译一致：原文为空的块不参与配对
+                card["block_pairs"] = [
+                    (index, block.text, tgt_entry.get("1.0", "end").strip())
+                    for index, block, _src, tgt_entry in rows
+                    if tgt_entry is not None and block.text
+                ]
+                card["pairs"] = [(src, tgt) for _index, src, tgt in card["block_pairs"]]
+                card["overlay"] = None
+
+            card["text"] = result.text.strip()
+            self._refresh_card(card)
+            if on_saved is not None:
+                on_saved()
+            self._set_status("已保存手工修改")
+            win.destroy()
+
         return win
 
     # -- translation ---------------------------------------------------------
@@ -990,6 +1097,21 @@ class MangaExtractApp:
 def _pil_to_bgr(image: Image.Image) -> np.ndarray:
     """PIL image -> OpenCV BGR array."""
     return cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+
+def _editor_height(text: str, per_row: int = 28) -> int:
+    """Line count for a Text widget roughly sized to its content."""
+    rows = -(-len(text) // per_row)  # ceil division
+    return max(1, min(5, rows))
+
+
+def _rewrite_block_text(block, text: str) -> None:
+    """Replace a block's OCR text with one line covering the whole block box."""
+    x1, y1, x2, y2 = (float(value) for value in block.xyxy)
+    block.lines = [ExtractedLine(
+        polygon=[[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+        text=text,
+    )]
 
 
 def _format_detail(result: Optional[PageResult],
