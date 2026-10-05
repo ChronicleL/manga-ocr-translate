@@ -13,6 +13,7 @@ import queue
 import threading
 import time
 import traceback
+from dataclasses import replace
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -46,6 +47,77 @@ FILE_TYPES = [
     ("图片", "*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff"),
     ("所有文件", "*.*"),
 ]
+
+# Presets for the AI model dropdown; the combobox itself stays editable.
+AI_MODEL_PRESETS = [
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "gpt-4o-mini",
+    "qwen-plus",
+    "glm-4-flash",
+    "moonshot-v1-8k",
+    "llama3.1",
+]
+
+# Sample used by the two "测试" buttons. It deliberately carries some content
+# (rather than a bare greeting) so a style prompt has something to act on.
+TEST_SENTENCE = "おい、この魔剣は重すぎるだろ…！とても振れる気がしないんだが。"
+
+THINKING_HELP = (
+    "很多推理模型（如 Qwen3 系列）默认会先「思考」再输出，翻译这种\n"
+    "简单任务会白白多花几倍时间。\n\n"
+    "勾选后请求里会带上 enable_thinking=false。同一个模型、同一句话\n"
+    "实测：不勾 6.9 秒（思考 364 字），勾上 1.5 秒。\n\n"
+    "注意：这是 Qwen / 通义等端点的参数。OpenAI 等不接受未知字段的\n"
+    "端点可能报 400，遇到就取消勾选。"
+)
+
+TEMPERATURE_HELP = (
+    "「随机性」即接口参数 temperature，决定模型输出的发散程度。\n\n"
+    "・0：每次输出几乎完全一样，最死板、最听话\n"
+    "・0.2 ~ 0.4：推荐翻译使用，措辞稳定、不跑偏（默认 0.3）\n"
+    "・0.7 ~ 1.0：更灵活多变，同一句每次翻法都不同，可能自由发挥\n"
+    "・大于 1：容易语无伦次；超出 0 ~ 2 会被服务端拒绝\n\n"
+    "想做风格化改写可以调到 0.6 ~ 0.8。\n"
+    "留空或填错不会报错，会自动回退到 0.3。"
+)
+
+
+class HoverTip:
+    """Show a small tooltip while the pointer rests on ``widget``."""
+
+    def __init__(self, widget: tk.Widget, text: str, wraplength: int = 340) -> None:
+        self.widget = widget
+        self.text = text
+        self.wraplength = wraplength
+        self.tip: Optional[tk.Toplevel] = None
+        widget.bind("<Enter>", self.show, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+        widget.bind("<Destroy>", self.hide, add="+")
+
+    def show(self, _event: object = None) -> None:
+        if self.tip is not None or not self.widget.winfo_exists():
+            return
+        tip = tk.Toplevel(self.widget)
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tk.Label(tip, text=self.text, justify="left", wraplength=self.wraplength,
+                 background="#ffffe1", foreground="#333333", relief="solid",
+                 borderwidth=1, padx=8, pady=6).pack()
+        tip.update_idletasks()
+        # Prefer the space above the widget, drop below it if there is none.
+        x = max(0, self.widget.winfo_rootx() + self.widget.winfo_width()
+                - tip.winfo_reqwidth())
+        y = self.widget.winfo_rooty() - tip.winfo_reqheight() - 6
+        if y < 0:
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        tip.geometry(f"+{x}+{y}")
+        self.tip = tip
+
+    def hide(self, _event: object = None) -> None:
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
 
 
 class MangaExtractApp:
@@ -622,16 +694,19 @@ class MangaExtractApp:
         return win
 
     def open_settings(self) -> None:
+        self.config.ensure_profiles()
+
         dlg = tk.Toplevel(self.root)
         dlg.title("翻译设置")
         dlg.attributes("-topmost", True)
-        dlg.geometry("560x470")
+        dlg.geometry("620x680")
         dlg.transient(self.root)
         dlg.resizable(False, False)
 
         body = ttk.Frame(dlg, padding=12)
         body.pack(fill="both", expand=True)
 
+        # -- 普通翻译（网页通道） ------------------------------------------
         web = ttk.LabelFrame(body, text="普通翻译（网页通道）", padding=10)
         web.pack(fill="x")
         ttk.Label(web, text="翻译引擎").grid(row=0, column=0, sticky="w")
@@ -643,77 +718,197 @@ class MangaExtractApp:
         ttk.Combobox(web, textvariable=lang_var, values=list(TARGET_LANGUAGES.keys()),
                      state="readonly", width=18).grid(row=1, column=1, sticky="w",
                                                       padx=(8, 0), pady=(6, 0))
+        web_result = tk.StringVar(value="")
+        ttk.Button(web, text="测试机翻", width=10,
+                   command=lambda: run_test("web")).grid(row=0, column=2, rowspan=2, padx=(14, 0))
+        ttk.Label(web, textvariable=web_result, foreground="#3a7", wraplength=500,
+                  justify="left").grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
+        # -- AI 翻译（多套 API 预设） --------------------------------------
         ai = ttk.LabelFrame(body, text="AI 翻译（OpenAI 兼容接口）", padding=10)
         ai.pack(fill="x", pady=(10, 0))
+
+        profile_var = tk.StringVar()
+        name_var = tk.StringVar(value=self.config.ai.name)
         base_var = tk.StringVar(value=self.config.ai.base_url)
         key_var = tk.StringVar(value=self.config.ai.api_key)
         model_var = tk.StringVar(value=self.config.ai.model)
         temp_var = tk.StringVar(value=str(self.config.ai.temperature))
-        fields = [
-            ("接口地址", base_var, False),
-            ("API Key", key_var, True),
-            ("模型名称", model_var, False),
-            ("随机性", temp_var, False),
-        ]
-        for row, (label, var, secret) in enumerate(fields):
-            pad = (0 if row == 0 else 6, 0)
-            ttk.Label(ai, text=label).grid(row=row, column=0, sticky="w", pady=pad)
-            entry = ttk.Entry(ai, textvariable=var, width=34, show="•" if secret else "")
-            entry.grid(row=row, column=1, sticky="we", padx=(8, 0), pady=pad)
-            if secret:
-                show_var = tk.BooleanVar(value=False)
-                ttk.Checkbutton(
-                    ai, text="显示", variable=show_var,
-                    command=lambda e=entry, v=show_var: e.configure(show="" if v.get() else "•"),
-                ).grid(row=row, column=2, padx=(6, 0))
+        think_var = tk.BooleanVar(value=self.config.ai.disable_thinking)
+        ai_result = tk.StringVar(value="")
+        state = {"index": 0}
+
+        ttk.Label(ai, text="接口配置").grid(row=0, column=0, sticky="w")
+        profile_box = ttk.Combobox(ai, textvariable=profile_var, state="readonly", width=30)
+        profile_box.grid(row=0, column=1, sticky="we", padx=(8, 0))
+
+        profile_actions = ttk.Frame(ai)
+        profile_actions.grid(row=0, column=2, sticky="w", padx=(6, 0))
+        ttk.Button(profile_actions, text="新增", width=6,
+                   command=lambda: add_profile()).pack(side="left")
+        ttk.Button(profile_actions, text="删除", width=6,
+                   command=lambda: delete_profile()).pack(side="left", padx=(4, 0))
+
+        ttk.Label(ai, text="名称").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(ai, textvariable=name_var, width=34).grid(row=1, column=1, sticky="we",
+                                                            padx=(8, 0), pady=(6, 0))
+        ttk.Label(ai, text="接口地址").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(ai, textvariable=base_var, width=34).grid(row=2, column=1, sticky="we",
+                                                            padx=(8, 0), pady=(6, 0))
+        ttk.Label(ai, text="API Key").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        key_entry = ttk.Entry(ai, textvariable=key_var, width=34, show="•")
+        key_entry.grid(row=3, column=1, sticky="we", padx=(8, 0), pady=(6, 0))
+        show_key = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ai, text="显示", variable=show_key,
+                        command=lambda: key_entry.configure(show="" if show_key.get() else "•"),
+                        ).grid(row=3, column=2, sticky="w", padx=(6, 0), pady=(6, 0))
+        ttk.Label(ai, text="模型").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        ttk.Combobox(ai, textvariable=model_var, values=AI_MODEL_PRESETS,
+                     width=32).grid(row=4, column=1, sticky="we", padx=(8, 0), pady=(6, 0))
+        ttk.Label(ai, text="随机性").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        temp_row = ttk.Frame(ai)
+        temp_row.grid(row=5, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(6, 0))
+        ttk.Entry(temp_row, textvariable=temp_var, width=10).pack(side="left")
+        think_check = ttk.Checkbutton(temp_row, text="关闭思考模式（更快）", variable=think_var)
+        think_check.pack(side="left", padx=(14, 0))
+        temp_help = ttk.Button(temp_row, text="?", width=2, cursor="question_arrow")
+        temp_help.pack(side="left", padx=(6, 0))
+        temp_help.configure(command=HoverTip(temp_help, TEMPERATURE_HELP).show)
+        HoverTip(think_check, THINKING_HELP)
+        ttk.Label(ai, text="提示词").grid(row=6, column=0, sticky="nw", pady=(6, 0))
+        prompt_text = tk.Text(ai, height=4, width=34, wrap="word")
+        prompt_text.grid(row=6, column=1, sticky="we", padx=(8, 0), pady=(6, 0))
+        if self.config.ai.prompt:
+            prompt_text.insert("1.0", self.config.ai.prompt)
+        ttk.Label(ai, text="追加给 AI 的风格要求，例如「用轻松吐槽的语气，保留拟声词」",
+                  foreground="#888").grid(row=7, column=1, sticky="w", padx=(8, 0))
+        ttk.Button(ai, text="测试 AI", width=10,
+                   command=lambda: run_test("ai")).grid(row=8, column=1, sticky="w", pady=(10, 0))
+        ttk.Label(ai, textvariable=ai_result, foreground="#3a7", wraplength=500,
+                  justify="left").grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 0))
         ai.columnconfigure(1, weight=1)
 
-        test_var = tk.StringVar(value="")
-        ttk.Label(body, textvariable=test_var, foreground="#3a7", wraplength=520,
-                  justify="left").pack(fill="x", pady=(10, 0))
-
-        def collect() -> TranslationConfig:
+        def temperature() -> float:
             try:
-                temperature = float(temp_var.get())
+                return float(temp_var.get())
             except ValueError:
-                temperature = 0.3
-            cfg = TranslationConfig(
-                mode=self._mode.get(),
-                web_engine=self._engine_code(engine_var.get()),
-                target_lang=self._lang_code(lang_var.get()),
-                ai=self.config.ai,
+                return 0.3
+
+        def refresh_profile_box(select: int) -> None:
+            names = [p.name or f"配置 {i + 1}" for i, p in enumerate(self.config.ai_profiles)]
+            profile_box.configure(values=names)
+            profile_box.current(select)
+
+        def load_profile(index: int) -> None:
+            profile = self.config.ai_profiles[index]
+            state["index"] = index
+            self.config.ai = profile
+            name_var.set(profile.name)
+            base_var.set(profile.base_url)
+            key_var.set(profile.api_key)
+            model_var.set(profile.model)
+            temp_var.set(str(profile.temperature))
+            think_var.set(profile.disable_thinking)
+            prompt_text.delete("1.0", "end")
+            if profile.prompt:
+                prompt_text.insert("1.0", profile.prompt)
+            refresh_profile_box(index)
+
+        def store_profile() -> None:
+            """Write the form back into the selected profile."""
+            index = state["index"]
+            profile = self.config.ai_profiles[index]
+            profile.name = name_var.get().strip() or f"配置 {index + 1}"
+            profile.base_url = base_var.get().strip()
+            profile.api_key = key_var.get().strip()
+            profile.model = model_var.get().strip()
+            profile.temperature = temperature()
+            profile.prompt = prompt_text.get("1.0", "end").strip()
+            profile.disable_thinking = bool(think_var.get())
+            self.config.ai = profile
+
+        def on_profile_selected(_event: object = None) -> None:
+            target = profile_box.current()
+            if target < 0 or target == state["index"]:
+                return
+            store_profile()
+            load_profile(target)
+
+        profile_box.bind("<<ComboboxSelected>>", on_profile_selected)
+
+        def add_profile() -> None:
+            store_profile()
+            current = self.config.ai_profiles[state["index"]]
+            self.config.ai_profiles.append(
+                replace(current, name=self.config.unique_profile_name(), api_key="")
             )
-            cfg.ai.base_url = base_var.get().strip()
-            cfg.ai.api_key = key_var.get().strip()
-            cfg.ai.model = model_var.get().strip()
-            cfg.ai.temperature = temperature
-            return cfg
+            load_profile(len(self.config.ai_profiles) - 1)
 
-        holder: Dict[str, str] = {}
+        def delete_profile() -> None:
+            if len(self.config.ai_profiles) <= 1:
+                messagebox.showinfo("无法删除", "至少保留一套 API 配置。", parent=dlg)
+                return
+            index = state["index"]
+            name = self.config.ai_profiles[index].name
+            if not messagebox.askyesno("删除配置", f"确定删除「{name}」吗？", parent=dlg):
+                return
+            del self.config.ai_profiles[index]
+            load_profile(min(index, len(self.config.ai_profiles) - 1))
 
-        def poll_test() -> None:
-            if "text" in holder:
-                test_var.set(holder.pop("text"))
-            elif dlg.winfo_exists():
-                dlg.after(150, poll_test)
+        load_profile(next((i for i, p in enumerate(self.config.ai_profiles)
+                           if p is self.config.ai), 0))
 
-        def run_test() -> None:
-            test_var.set("测试中…")
-            cfg = collect()
+        # -- 两个通道各自独立的「测试」 ------------------------------------
+        test_vars = {"web": web_result, "ai": ai_result}
+        results: Dict[str, str] = {}
+        active: set = set()
+        polling = {"running": False}
+
+        def poll_tests() -> None:
+            for channel in list(results):
+                test_vars[channel].set(results.pop(channel))
+                active.discard(channel)
+            if not dlg.winfo_exists() or not active:
+                polling["running"] = False
+                return
+            dlg.after(150, poll_tests)
+
+        def run_test(channel: str) -> None:
+            if channel in active:
+                return
+            store_profile()
+            active.add(channel)
+            test_vars[channel].set("测试中…")
+            if channel == "web":
+                cfg = TranslationConfig(
+                    mode="web",
+                    web_engine=self._engine_code(engine_var.get()),
+                    target_lang=self._lang_code(lang_var.get()),
+                )
+            else:
+                cfg = TranslationConfig(
+                    mode="ai",
+                    target_lang=self._lang_code(lang_var.get()),
+                    ai=replace(self.config.ai),
+                )
 
             def work() -> None:
                 try:
-                    out = cfg.build_translator().translate(["こんにちは、いい天気ですね。"])
-                    holder["text"] = "✓ " + (out[0] if out else "(空)")
+                    out = cfg.build_translator().translate([TEST_SENTENCE])
+                    results[channel] = "✓ " + (out[0] if out else "(空)")
                 except Exception as exc:  # noqa: BLE001 - surfaced to the user
-                    holder["text"] = f"✗ {exc}"
+                    results[channel] = f"✗ {exc}"
 
             threading.Thread(target=work, daemon=True).start()
-            poll_test()
+            if not polling["running"]:
+                polling["running"] = True
+                dlg.after(150, poll_tests)
 
         def save_and_close() -> None:
-            self.config = collect()
+            store_profile()
+            self.config.mode = self._mode.get()
+            self.config.web_engine = self._engine_code(engine_var.get())
+            self.config.target_lang = self._lang_code(lang_var.get())
             self._mode.set(self.config.mode)
             self._save_config()
             self._refresh_mode_labels()
@@ -722,7 +917,6 @@ class MangaExtractApp:
 
         actions = ttk.Frame(body)
         actions.pack(fill="x", side="bottom", pady=(12, 0))
-        ttk.Button(actions, text="测试", width=8, command=run_test).pack(side="left")
         ttk.Button(actions, text="保存", width=8, command=save_and_close).pack(side="right")
         ttk.Button(actions, text="取消", width=8, command=dlg.destroy).pack(side="right", padx=(0, 6))
 

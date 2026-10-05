@@ -16,6 +16,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -207,11 +208,24 @@ class MyMemoryTranslator(BaseTranslator):
 
 @dataclass
 class AIConfig:
+    """One OpenAI-compatible endpoint preset ("一套 API").
+
+    ``name`` is only a label shown in the UI; ``prompt`` carries the style
+    requirements plugged into :meth:`AITranslator.system_prompt`.
+
+    ``disable_thinking`` adds ``enable_thinking: false`` to the request body.
+    Reasoning models such as the Qwen3 family otherwise spend a long time on a
+    chain of thought before answering, which multiplies translation latency.
+    """
+
     base_url: str = "https://api.deepseek.com/v1"
     api_key: str = ""
     model: str = "deepseek-chat"
     temperature: float = 0.3
     timeout: float = 90.0
+    name: str = "默认"
+    prompt: str = ""
+    disable_thinking: bool = False
 
 
 class AITranslator(BaseTranslator):
@@ -219,15 +233,25 @@ class AITranslator(BaseTranslator):
 
     name = "ai"
 
-    SYSTEM_PROMPT = (
-        "你是资深的日文漫画翻译。把用户给出的每一条日文翻译成自然、口语化的"
-        "简体中文，保持条目数量与顺序完全不变，不要合并或拆分条目，不要加解释。"
-        "只输出一个 JSON 字符串数组，每个元素对应一条译文。"
+    # Assembled from three parts so a user-supplied style requirement lands
+    # *before* the output-format rules instead of trailing them: instructions
+    # placed last tend to be outweighed by an earlier default tone.
+    PROMPT_HEAD = "你是资深的日文漫画翻译。\n\n【风格要求（优先于默认语气，必须严格遵守）】\n"
+    DEFAULT_STYLE = "译文要自然、口语化。"
+    PROMPT_TAIL = (
+        "\n\n【输出格式】\n"
+        "把用户给出的每一条日文按上面的风格翻译成简体中文，保持条目数量与顺序完全不变，"
+        "不要合并或拆分条目，不要加解释。只输出一个 JSON 字符串数组，每个元素对应一条译文。"
     )
 
     def __init__(self, config: AIConfig, target_lang: str = "zh-CN") -> None:
         super().__init__(target_lang=target_lang, timeout=config.timeout)
         self.config = config
+
+    def system_prompt(self) -> str:
+        """Built-in role/format rules with the user's style requirement inside."""
+        style = (self.config.prompt or "").strip() or self.DEFAULT_STYLE
+        return f"{self.PROMPT_HEAD}{style}{self.PROMPT_TAIL}"
 
     def translate(self, texts: Sequence[str]) -> List[str]:
         items = list(texts)
@@ -237,42 +261,38 @@ class AITranslator(BaseTranslator):
         if len(result) == len(items):
             return result
         # Count mismatch would misalign the pairs; translate one by one instead.
-        return [self._single(text) for text in items]
+        # The requests are independent, so run them concurrently rather than
+        # paying the full round trip once per line.
+        workers = min(4, len(items))
+        if workers <= 1:
+            return [self._single(text) for text in items]
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(self._single, items))
 
-    def _request(self, items: List[str]) -> List[str]:
+    def _chat(self, items: List[str]) -> str:
         payload = {
             "model": self.config.model,
             "temperature": self.config.temperature,
             "messages": [
-                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "system", "content": self.system_prompt()},
                 {"role": "user", "content": json.dumps(items, ensure_ascii=False)},
             ],
         }
+        if self.config.disable_thinking:
+            payload["enable_thinking"] = False
         url = self.config.base_url.rstrip("/") + "/chat/completions"
         headers = {"Authorization": f"Bearer {self.config.api_key}"} if self.config.api_key else {}
         data = _http_post_json(url, payload, headers, self.timeout)
         try:
-            content = data["choices"][0]["message"]["content"]
+            return str(data["choices"][0]["message"]["content"])
         except (KeyError, IndexError, TypeError) as exc:
             raise TranslationError(f"AI 返回了意外的数据：{str(data)[:300]}") from exc
-        return _parse_json_array(content)
+
+    def _request(self, items: List[str]) -> List[str]:
+        return _parse_json_array(self._chat(items))
 
     def _single(self, text: str) -> str:
-        payload = {
-            "model": self.config.model,
-            "temperature": self.config.temperature,
-            "messages": [
-                {"role": "system", "content": self.SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps([text], ensure_ascii=False)},
-            ],
-        }
-        url = self.config.base_url.rstrip("/") + "/chat/completions"
-        headers = {"Authorization": f"Bearer {self.config.api_key}"} if self.config.api_key else {}
-        data = _http_post_json(url, payload, headers, self.timeout)
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise TranslationError(f"AI 返回了意外的数据：{str(data)[:300]}") from exc
+        content = self._chat([text])
         parsed = _parse_json_array(content)
         return parsed[0] if parsed else content.strip()
 
@@ -293,6 +313,14 @@ def _parse_json_array(content: str) -> List[str]:
     return [ln for ln in lines if ln]
 
 
+def _ai_config(data: object) -> AIConfig:
+    """Build an :class:`AIConfig` from untrusted JSON, ignoring unknown keys."""
+    if not isinstance(data, dict):
+        data = {}
+    allowed = set(AIConfig.__dataclass_fields__)
+    return AIConfig(**{key: value for key, value in data.items() if key in allowed})
+
+
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
@@ -304,6 +332,10 @@ class TranslationConfig:
     web_engine: str = "google"        # google | youdao | mymemory
     target_lang: str = "zh-CN"
     ai: AIConfig = field(default_factory=AIConfig)
+    ai_profiles: List[AIConfig] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.ensure_profiles()
 
     def to_dict(self) -> dict:
         return {
@@ -311,20 +343,45 @@ class TranslationConfig:
             "web_engine": self.web_engine,
             "target_lang": self.target_lang,
             "ai": asdict(self.ai),
+            "ai_profiles": [asdict(profile) for profile in self.ai_profiles],
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "TranslationConfig":
         data = data or {}
-        ai_data = data.get("ai") or {}
-        allowed = set(AIConfig.__dataclass_fields__)
-        ai = AIConfig(**{k: v for k, v in ai_data.items() if k in allowed})
-        return cls(
+        profiles = [_ai_config(data_item) for data_item in data.get("ai_profiles") or []]
+        config = cls(
             mode=data.get("mode", "web"),
             web_engine=data.get("web_engine", "google"),
             target_lang=data.get("target_lang", "zh-CN"),
-            ai=ai,
+            ai=_ai_config(data.get("ai")),
+            ai_profiles=profiles,
         )
+        config.ensure_profiles()
+        return config
+
+    def ensure_profiles(self) -> None:
+        """Make sure the active AI config is one of the stored profiles."""
+        if not self.ai_profiles:
+            self.ai_profiles = [self.ai]
+            return
+        if any(profile is self.ai for profile in self.ai_profiles):
+            return
+        for profile in self.ai_profiles:
+            if profile.name == self.ai.name:
+                self.ai = profile
+                return
+        self.ai_profiles.append(self.ai)
+
+    def unique_profile_name(self, base: str = "新配置") -> str:
+        """Return an unused profile name, derived from ``base``."""
+        used = {profile.name for profile in self.ai_profiles}
+        if base not in used:
+            return base
+        index = 2
+        while f"{base} {index}" in used:
+            index += 1
+        return f"{base} {index}"
 
     def save(self, path: str | Path) -> None:
         Path(path).write_text(
