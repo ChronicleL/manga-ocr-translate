@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Downloaded model weights
+models/*.onnx
+
+# Local user config (may contain API keys)
+translate_config.json
+
+# Local scratch / outputs
+_scratch/
+.ref/
+out/
+*.vis.png

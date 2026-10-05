@@ -1,0 +1,9 @@
+# Core detection (no PyTorch required)
+numpy>=1.24
+opencv-python-headless>=4.8
+onnxruntime>=1.16
+pillow>=10.0
+shapely>=2.0
+
+# Japanese OCR (pulls in torch + transformers)
+manga-ocr>=0.1.11
