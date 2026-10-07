@@ -19,7 +19,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -64,13 +64,50 @@ def _http_post_json(url: str, payload: dict, headers: Optional[dict], timeout: f
     return json.loads(_read(request, timeout))
 
 
+# Friendly hints for the status codes the free web engines commonly return.
+_HTTP_HINTS: Dict[int, str] = {
+    400: "请求被拒绝",
+    401: "需要身份验证",
+    403: "访问被拒绝",
+    404: "接口不存在",
+    408: "请求超时",
+    429: "请求过于频繁，稍后再试或换个引擎",
+    500: "服务器内部错误",
+    502: "网关错误",
+    503: "服务暂时不可用",
+    504: "网关超时",
+}
+
+
+def _plain_snippet(body: str, limit: int = 160) -> str:
+    """Reduce an error body to a short single-line hint.
+
+    Error pages are usually full HTML documents (e.g. Google's 429), which are
+    meaningless to the user, so they are dropped entirely.
+    """
+    text = body.strip()
+    if not text or re.search(r"<\s*(?:!doctype|html|head|body|meta|title)\b", text, re.I):
+        return ""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit].rstrip() + "…" if len(text) > limit else text
+
+
+def _http_error(code: int, body: str) -> TranslationError:
+    label = f"HTTP {code}"
+    if code in _HTTP_HINTS:
+        label += f"（{_HTTP_HINTS[code]}）"
+    snippet = _plain_snippet(body)
+    return TranslationError(f"{label}：{snippet}" if snippet else label)
+
+
 def _read(request: urllib.request.Request, timeout: float) -> str:
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:400]
-        raise TranslationError(f"HTTP {exc.code}：{detail}") from exc
+        body = exc.read().decode("utf-8", "replace")
+        raise _http_error(exc.code, body) from exc
     except urllib.error.URLError as exc:
         raise TranslationError(f"网络错误：{exc.reason}") from exc
     except TimeoutError as exc:
@@ -282,7 +319,8 @@ class AITranslator(BaseTranslator):
             payload["enable_thinking"] = False
         url = self.config.base_url.rstrip("/") + "/chat/completions"
         headers = {"Authorization": f"Bearer {self.config.api_key}"} if self.config.api_key else {}
-        data = _http_post_json(url, payload, headers, self.timeout)
+        # Parsed JSON from the endpoint: shape is checked by the try/except below.
+        data: Any = _http_post_json(url, payload, headers, self.timeout)
         try:
             return str(data["choices"][0]["message"]["content"])
         except (KeyError, IndexError, TypeError) as exc:

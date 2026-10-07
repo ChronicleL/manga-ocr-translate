@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, cast
 
 import cv2
 import numpy as np
@@ -33,6 +33,45 @@ MAX_CANDIDATES = 1000
 
 # Index 0 -> horizontal/English text, index 1 -> vertical/Japanese text.
 LANG_LIST: Tuple[str, ...] = ("eng", "ja", "unknown")
+
+# Execution providers, most preferred first, used when ``device="auto"``.
+CUDA_PROVIDER = "CUDAExecutionProvider"
+DML_PROVIDER = "DmlExecutionProvider"
+OPENVINO_PROVIDER = "OpenVINOExecutionProvider"
+
+_DEVICE_PROVIDERS: Dict[str, str] = {
+    "cuda": CUDA_PROVIDER,
+    "dml": DML_PROVIDER,
+    "openvino": OPENVINO_PROVIDER,
+}
+_AUTO_ORDER: Tuple[str, ...] = (CUDA_PROVIDER, DML_PROVIDER, OPENVINO_PROVIDER)
+
+
+def available_devices() -> List[str]:
+    """Device names this installation can actually accelerate with."""
+    providers = set(ort.get_available_providers())
+    devices = ["auto", "cpu"]
+    devices += [name for name, provider in _DEVICE_PROVIDERS.items() if provider in providers]
+    return devices
+
+
+def resolve_providers(device: str = "auto") -> List[str]:
+    """Return the ONNX Runtime providers to request for ``device``.
+
+    ``auto`` prefers a GPU/accelerator provider and falls back to CPU. A
+    requested but unavailable provider also falls back to CPU, so a saved
+    setting can never stop the app from starting. CPU stays as a secondary
+    entry so ONNX Runtime can still place nodes the accelerator rejects.
+    """
+    providers = set(ort.get_available_providers())
+    if device == "auto":
+        wanted = next((p for p in _AUTO_ORDER if p in providers), None)
+    else:
+        candidate = _DEVICE_PROVIDERS.get(device)
+        wanted = candidate if candidate in providers else None
+    if wanted is None:
+        return ["CPUExecutionProvider"]
+    return [wanted, "CPUExecutionProvider"]
 
 
 @dataclass
@@ -230,6 +269,8 @@ class ComicTextDetector:
         nms_iou_thresh: float = NMS_IOU_THRESH,
         box_score_thresh: float = BOX_SCORE_THRESH,
         unclip_ratio: float = UNCLIP_RATIO,
+        device: str = "auto",
+        threads: int = 0,
     ) -> None:
         self.model_path = Path(model_path)
         if not self.model_path.is_file():
@@ -242,10 +283,18 @@ class ComicTextDetector:
         self.nms_iou_thresh = nms_iou_thresh
         self.box_score_thresh = box_score_thresh
         self.unclip_ratio = unclip_ratio
+
+        options = ort.SessionOptions()
+        if threads and threads > 0:
+            # One inference stream at a time, so inter-op parallelism only adds
+            # contention; keep the budget on the intra-op pool instead.
+            options.intra_op_num_threads = int(threads)
+            options.inter_op_num_threads = 1
+        chosen = list(providers) if providers else resolve_providers(device)
         self.session = ort.InferenceSession(
-            str(self.model_path),
-            providers=list(providers) if providers else ["CPUExecutionProvider"],
+            str(self.model_path), sess_options=options, providers=chosen
         )
+        self.providers = self.session.get_providers()
         self._input_name = self.session.get_inputs()[0].name
         outputs = {o.name: o for o in self.session.get_outputs()}
         self._blk_name = "blk" if "blk" in outputs else self.session.get_outputs()[0].name
@@ -269,7 +318,9 @@ class ComicTextDetector:
         im_h, im_w = img_bgr.shape[:2]
         blob, (dw, dh) = self._preprocess(img_bgr)
 
-        outputs = self.session.run(None, {self._input_name: blob})
+        # All heads of this model are dense float tensors, but the onnxruntime
+        # stubs type the outputs as a union that includes SparseTensor.
+        outputs = cast(List[np.ndarray], self.session.run(None, {self._input_name: blob}))
         named = {o.name: v for o, v in zip(self.session.get_outputs(), outputs)}
         blk = named[self._blk_name][0]
         seg = named[self._seg_name][0] if self._seg_name else None

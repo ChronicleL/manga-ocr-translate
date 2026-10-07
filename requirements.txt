@@ -1,9 +1,15 @@
 # Core detection (no PyTorch required)
 numpy>=1.24
 opencv-python-headless>=4.8
+# CPU build. For GPU-accelerated detection install ONE of these *instead*
+# (it replaces this package, and --device auto then picks it up automatically):
+#   pip install onnxruntime-directml   # Windows 通用（NVIDIA/AMD/Intel），无需 CUDA
+#   pip install onnxruntime-gpu        # 仅 NVIDIA，需自备 CUDA 12 + cuDNN 9
+# 实测（RTX 4070，单页检测）: CPU 约 18.4s -> DirectML 约 0.05s。
 onnxruntime>=1.16
 pillow>=10.0
 shapely>=2.0
 
-# Japanese OCR (pulls in torch + transformers)
+# Japanese OCR (pulls in torch + transformers). The default torch wheel is
+# CPU-only; OCR is only ~2s per page, so a CUDA build is usually not worth it.
 manga-ocr>=0.1.11

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import os
 import queue
+import sys
 import threading
 import time
 import traceback
@@ -23,9 +24,10 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageGrab, ImageTk
 
-from ..detector import ComicTextDetector
+from ..detector import ComicTextDetector, available_devices
 from ..pipeline import ExtractedLine, MangaExtractor, PageResult
 from ..recognizer import MangaOcrRecognizer
+from ..runtime import DEVICE_LABELS, OCR_BATCH_CHOICES, EngineConfig
 from ..translation import (
     TARGET_LANGUAGES,
     WEB_ENGINES,
@@ -36,9 +38,28 @@ from ..typeset import TypesetError, build_translations_for_blocks, render_transl
 from ..visualize import draw_result
 from .capture import enable_dpi_awareness, select_region
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DETECTOR = PROJECT_ROOT / "models" / "comic-text-detector.onnx"
-CONFIG_PATH = PROJECT_ROOT / "translate_config.json"
+def _resource_root() -> Path:
+    """Directory holding read-only bundled resources (``models/``)."""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    return Path(__file__).resolve().parents[2]
+
+
+def _settings_root() -> Path:
+    """Writable directory for the user's config files.
+
+    When frozen this is the folder containing the executable, so settings live
+    next to the app instead of inside the read-only bundle.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
+RESOURCE_ROOT = _resource_root()
+DEFAULT_DETECTOR = RESOURCE_ROOT / "models" / "comic-text-detector.onnx"
+CONFIG_PATH = _settings_root() / "translate_config.json"
+ENGINE_CONFIG_PATH = _settings_root() / "engine_config.json"
 
 CARD_BG = "#f6f7f9"
 CARD_BORDER = "#c9ced6"
@@ -81,6 +102,42 @@ TEMPERATURE_HELP = (
     "想做风格化改写可以调到 0.6 ~ 0.8。\n"
     "留空或填错不会报错，会自动回退到 0.3。"
 )
+
+DEVICE_HELP = (
+    "推理后端。检测走 ONNX Runtime，OCR 走 PyTorch。\n\n"
+    "・自动：只要装了带 GPU 支持的 onnxruntime 且显卡可用，就走 GPU，\n"
+    "  否则退回 CPU。默认值。\n"
+    "・仅 CPU：强制纯 CPU，兼容性最好。\n"
+    "・CUDA / DirectML / OpenVINO：需要对应版本的 onnxruntime\n"
+    "  （onnxruntime-gpu / onnxruntime-directml / onnxruntime-openvino），\n"
+    "  没装的话下拉里不会出现。\n\n"
+    "注意：本模型检测输入固定 1024×1024，纯 CPU 单页检测通常要十几秒，\n"
+    "换成 GPU 是最有效的提速手段。"
+)
+
+PERF_HELP = (
+    "纯 CPU 推理本身较慢（检测固定 1024×1024，最耗时）。\n"
+    "・执行后端：装了 GPU 版 onnxruntime 且显卡可用时，选「自动」即可走 GPU。\n"
+    "・CPU 线程：0 为自动；检测与 OCR 共用该线程数（填物理核心数通常最稳）。\n"
+    "・OCR 批处理：把整页文本行凑成一批做一次前向，纯 CPU 上 4~8 一般最快。\n"
+    "改动在点「保存」后会自动重新加载模型。"
+)
+
+
+def _parse_threads(value: str) -> int:
+    """Read a CPU-thread count; anything unparsable means 'auto' (0)."""
+    try:
+        return max(0, int(str(value).strip()))
+    except ValueError:
+        return 0
+
+
+def _parse_batch(value: str) -> int:
+    """Read an OCR batch size; anything unparsable means 1."""
+    try:
+        return max(1, int(str(value).strip()))
+    except ValueError:
+        return 1
 
 
 class HoverTip:
@@ -142,12 +199,15 @@ class MangaExtractApp:
         self._cards: List[Dict] = []
         self._thumb_refs: List[ImageTk.PhotoImage] = []
         self._text_labels: List[tk.Label] = []
+        self._placeholder: Optional[tk.Label] = None
         self._not_ready = "正在加载模型…"
 
         self.config = TranslationConfig.load(CONFIG_PATH)
+        self.engine = EngineConfig.load(ENGINE_CONFIG_PATH)
         self._mode = tk.StringVar(value=self.config.mode)
         self._translating = False
         self._translating_cards: List[Dict] = []
+        self._exporting_overlays = False
 
         root.title("漫画文字提取")
         root.geometry("460x660+80+80")
@@ -185,6 +245,8 @@ class MangaExtractApp:
         bar2.pack(fill="x", pady=(0, 6))
         ttk.Button(bar2, text="复制全部", width=9, command=self.on_copy_all).pack(side="left")
         ttk.Button(bar2, text="保存…", width=7, command=self.on_save).pack(side="left", padx=(4, 0))
+        ttk.Button(bar2, text="导出叠图…", width=10,
+                   command=self.on_export_overlays).pack(side="left", padx=(4, 0))
         ttk.Button(bar2, text="清空", width=6, command=self.on_clear).pack(side="left", padx=(4, 0))
         ttk.Button(bar2, text="翻译设置", width=9,
                    command=self.open_settings).pack(side="left", padx=(4, 0))
@@ -243,12 +305,33 @@ class MangaExtractApp:
         try:
             if not self.model_path.is_file():
                 raise FileNotFoundError(f"找不到检测模型：{self.model_path}")
-            detector = ComicTextDetector(self.model_path)
-            recognizer = MangaOcrRecognizer(hf_endpoint=self.hf_endpoint)
+            detector = ComicTextDetector(
+                self.model_path, device=self.engine.device, threads=self.engine.threads
+            )
+            recognizer = MangaOcrRecognizer(
+                hf_endpoint=self.hf_endpoint,
+                device=self.engine.device,
+                threads=self.engine.threads,
+                batch_size=self.engine.ocr_batch,
+            )
             self.extractor = MangaExtractor(detector=detector, recognizer=recognizer)
-            self.queue.put(("ready", None))
+            backend = detector.providers[0].replace("ExecutionProvider", "")
+            if backend == "CPU":
+                # Make the silent fall-back visible: "auto" cannot use a GPU
+                # unless a GPU build of onnxruntime is installed.
+                backend += "（未启用 GPU 加速，检测会慢很多）"
+            self.queue.put(("ready", f"检测 {backend}　·　OCR {recognizer.device}"))
         except Exception:
             self.queue.put(("fatal", traceback.format_exc()))
+
+    def reload_models(self) -> None:
+        """Re-create the detector/recognizer after a performance change."""
+        self.extractor = None
+        self._not_ready = "正在加载模型…"
+        for button in (self.btn_capture, self.btn_clip, self.btn_open):
+            button.configure(state="disabled")
+        self._set_status("正在加载模型…")
+        threading.Thread(target=self._load_models, daemon=True).start()
 
     # -- event queue ---------------------------------------------------------
     def _poll(self) -> None:
@@ -256,13 +339,15 @@ class MangaExtractApp:
             while True:
                 kind, payload = self.queue.get_nowait()
                 if kind == "ready":
-                    self._on_ready()
+                    self._on_ready(payload or "")
                 elif kind == "result":
                     self._on_result(*payload)
                 elif kind == "error":
                     self._on_error(payload)
                 elif kind == "fatal":
                     self._on_fatal(payload)
+                elif kind == "overlays_done":
+                    self._on_overlays_done(*payload)
                 elif kind == "translated":
                     self._on_translated(*payload)
                 elif kind == "translation_done":
@@ -274,10 +359,13 @@ class MangaExtractApp:
             pass
         self.root.after(80, self._poll)
 
-    def _on_ready(self) -> None:
+    def _on_ready(self, info: str = "") -> None:
         for button in (self.btn_capture, self.btn_clip, self.btn_open):
             button.configure(state="normal")
-        self._set_status("就绪　·　点「截取」框选图片区域")
+        message = "就绪　·　点「截取」框选图片区域"
+        if info:
+            message += f"　·　{info}"
+        self._set_status(message)
 
     def _on_fatal(self, message: str) -> None:
         self._set_status("模型加载失败")
@@ -352,9 +440,12 @@ class MangaExtractApp:
         threading.Thread(target=self._run_extract, args=(image,), daemon=True).start()
 
     def _run_extract(self, image: Image.Image) -> None:
+        extractor = self.extractor
         try:
+            if extractor is None:
+                raise RuntimeError("模型尚未加载完成")
             bgr = _pil_to_bgr(image)
-            result = self.extractor.extract_page(bgr)
+            result = extractor.extract_page(bgr)
             vis = draw_result(bgr, result)
             annotated = Image.fromarray(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
             self.queue.put(("result", (image, result, annotated)))
@@ -394,7 +485,7 @@ class MangaExtractApp:
 
     # -- log cards -----------------------------------------------------------
     def _add_pending_card(self, image: Image.Image) -> Dict:
-        if getattr(self, "_placeholder", None) is not None:
+        if self._placeholder is not None:
             self._placeholder.destroy()
             self._placeholder = None
 
@@ -615,6 +706,13 @@ class MangaExtractApp:
     def _lang_code(label: str) -> str:
         return TARGET_LANGUAGES.get(label, "zh-CN")
 
+    @staticmethod
+    def _device_code(label: str) -> str:
+        for code, text in DEVICE_LABELS.items():
+            if text == label:
+                return code
+        return "auto"
+
     def _refresh_mode_labels(self) -> None:
         self._web_radio.configure(text=f"普通·{self._engine_label(self.config.web_engine)}")
 
@@ -807,11 +905,35 @@ class MangaExtractApp:
         dlg.title("翻译设置")
         dlg.attributes("-topmost", True)
         dlg.geometry("620x680")
+        dlg.minsize(560, 420)
         dlg.transient(self.root)
-        dlg.resizable(False, False)
 
-        body = ttk.Frame(dlg, padding=12)
-        body.pack(fill="both", expand=True)
+        # Fixed action bar at the bottom; the settings scroll above it so a long
+        # test result can never push the buttons or lower sections out of view.
+        actions = ttk.Frame(dlg, padding=(12, 0, 12, 12))
+        actions.pack(fill="x", side="bottom")
+
+        area = ttk.Frame(dlg, padding=(12, 12, 12, 0))
+        area.pack(fill="both", expand=True)
+        canvas = tk.Canvas(area, highlightthickness=0)
+        vbar = ttk.Scrollbar(area, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vbar.pack(side="right", fill="y")
+
+        body = ttk.Frame(canvas)
+        body_window = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>",
+                  lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(body_window, width=e.width))
+
+        def on_wheel(event: "tk.Event") -> None:
+            if isinstance(event.widget, ttk.Combobox):
+                return  # let the combobox change its own selection
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        dlg.bind("<MouseWheel>", on_wheel)
 
         # -- 普通翻译（网页通道） ------------------------------------------
         web = ttk.LabelFrame(body, text="普通翻译（网页通道）", padding=10)
@@ -894,6 +1016,36 @@ class MangaExtractApp:
         ttk.Label(ai, textvariable=ai_result, foreground="#3a7", wraplength=500,
                   justify="left").grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 0))
         ai.columnconfigure(1, weight=1)
+
+        # -- 性能（执行后端 / 线程 / OCR 批处理） --------------------------
+        perf = ttk.LabelFrame(body, text="性能（修改后自动重新加载模型）", padding=10)
+        perf.pack(fill="x", pady=(10, 0))
+        perf.columnconfigure(1, weight=1)
+
+        devices = available_devices()
+        device_var = tk.StringVar(value=DEVICE_LABELS.get(self.engine.device, self.engine.device))
+        ttk.Label(perf, text="执行后端").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(perf, textvariable=device_var,
+                     values=[DEVICE_LABELS.get(name, name) for name in devices],
+                     state="readonly", width=22).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        device_help = ttk.Button(perf, text="?", width=2, cursor="question_arrow")
+        device_help.grid(row=0, column=2, sticky="w", padx=(6, 0))
+        device_help.configure(command=HoverTip(device_help, DEVICE_HELP).show)
+
+        threads_var = tk.StringVar(value=str(self.engine.threads))
+        ttk.Label(perf, text="CPU 线程").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(perf, textvariable=threads_var, width=8).grid(
+            row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+
+        batch_var = tk.StringVar(value=str(self.engine.ocr_batch))
+        ttk.Label(perf, text="OCR 批处理").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Combobox(perf, textvariable=batch_var,
+                     values=[str(n) for n in OCR_BATCH_CHOICES],
+                     state="readonly", width=8).grid(
+            row=2, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+
+        ttk.Label(perf, text=PERF_HELP, foreground="#888", wraplength=520,
+                  justify="left").grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         def temperature() -> float:
             try:
@@ -1019,11 +1171,25 @@ class MangaExtractApp:
             self._mode.set(self.config.mode)
             self._save_config()
             self._refresh_mode_labels()
-            self._set_status("翻译设置已保存")
+
+            engine = EngineConfig(
+                device=self._device_code(device_var.get()),
+                threads=_parse_threads(threads_var.get()),
+                ocr_batch=_parse_batch(batch_var.get()),
+            ).normalized()
+            changed = engine != self.engine
+            self.engine = engine
+            try:
+                engine.save(ENGINE_CONFIG_PATH)
+            except OSError as exc:
+                self._set_status(f"性能设置保存失败：{exc}")
+            if changed:
+                # device/threads/batch only take effect on a fresh session.
+                self.reload_models()
+            else:
+                self._set_status("翻译设置已保存")
             dlg.destroy()
 
-        actions = ttk.Frame(body)
-        actions.pack(fill="x", side="bottom", pady=(12, 0))
         ttk.Button(actions, text="保存", width=8, command=save_and_close).pack(side="right")
         ttk.Button(actions, text="取消", width=8, command=dlg.destroy).pack(side="right", padx=(0, 6))
 
@@ -1042,6 +1208,64 @@ class MangaExtractApp:
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self._set_status(f"已复制 {len(text)} 字")
+
+    def on_export_overlays(self) -> None:
+        """Export the translated-image overlay of every translated card at once."""
+        if self._exporting_overlays:
+            self._set_status("正在导出叠图，请稍候…")
+            return
+        cards = [card for card in self._cards if card.get("block_pairs")]
+        if not cards:
+            self._set_status("还没有可叠图的译文，请先翻译")
+            return
+        out_dir = filedialog.askdirectory(title="选择叠图导出目录")
+        if not out_dir:
+            return
+        self._exporting_overlays = True
+        self._set_status(f"正在导出 {len(cards)} 张叠图…")
+        threading.Thread(target=self._export_overlays, args=(cards, out_dir),
+                         daemon=True).start()
+
+    def _export_overlays(self, cards: List[Dict], out_dir: str) -> None:
+        """Render and write one overlay per card (runs off the UI thread)."""
+        directory = Path(out_dir)
+        saved = 0
+        failures: List[str] = []
+        width = len(str(len(cards)))
+        for number, card in enumerate(cards, start=1):
+            try:
+                overlay = card.get("overlay")
+                if overlay is None:
+                    result = card["result"]
+                    translations = build_translations_for_blocks(
+                        result.blocks, card["block_pairs"]
+                    )
+                    overlay = render_translated_image(
+                        _pil_to_bgr(card["image"]), result.blocks, translations
+                    )
+                overlay.convert("RGB").save(directory / f"translated_{number:0{width}d}.png")
+                saved += 1
+            except TypesetError as exc:
+                failures.append(f"第 {number} 张：{exc}")
+            except Exception as exc:  # noqa: BLE001 - surfaced to the user
+                failures.append(f"第 {number} 张：{type(exc).__name__}: {exc}")
+        self.queue.put(("overlays_done", (saved, len(cards), str(directory), failures)))
+
+    def _on_overlays_done(self, saved: int, total: int, directory: str,
+                          failures: List[str]) -> None:
+        self._exporting_overlays = False
+        if failures:
+            self._set_status(f"叠图导出完成：{saved}/{total} 张")
+            detail = "\n".join(failures[:8])
+            if len(failures) > 8:
+                detail += f"\n…另有 {len(failures) - 8} 张失败"
+            messagebox.showwarning(
+                "批量导出叠图",
+                f"成功 {saved}/{total} 张，输出目录：\n{directory}\n\n失败：\n{detail}",
+            )
+            return
+        self._set_status(f"已导出 {saved} 张叠图到 {directory}")
+        messagebox.showinfo("批量导出叠图", f"已导出 {saved} 张叠图到：\n{directory}")
 
     def on_save(self) -> None:
         texts = [self._card_display(c) for c in self._cards if self._card_display(c)]
@@ -1067,7 +1291,7 @@ class MangaExtractApp:
             self._pending["frame"].destroy()
             self._pending = None
         self._translating_cards = []
-        if getattr(self, "_placeholder", None) is None:
+        if self._placeholder is None:
             self._add_placeholder()
         self._set_status("已清空")
 

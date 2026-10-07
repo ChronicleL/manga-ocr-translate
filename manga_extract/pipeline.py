@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -95,6 +95,13 @@ def crop_polygon_region(
     return image[top:bottom, left:right]
 
 
+def _recognize_all(recognizer: Any, crops: Sequence[np.ndarray]) -> List[str]:
+    """Recognize crops in one go when the recognizer supports batching."""
+    if hasattr(recognizer, "recognize_many"):
+        return list(map(str, recognizer.recognize_many(crops)))
+    return [recognizer.recognize(crop) for crop in crops]
+
+
 class MangaExtractor:
     """Detect, order and read Japanese text from manga page images."""
 
@@ -140,6 +147,8 @@ class MangaExtractor:
 
         recognizer = self._recognizer
         result_blocks: List[ExtractedBlock] = []
+        slots: List[Tuple[int, int]] = []  # (block index, line index)
+        crops: List[np.ndarray] = []
         for block in blocks:
             extracted = ExtractedBlock(
                 xyxy=list(block.xyxy),
@@ -147,18 +156,24 @@ class MangaExtractor:
                 vertical=block.vertical,
             )
             for polygon in block.lines:
-                text = ""
-                if recognizer is not None:
-                    crop = crop_polygon_region(image, polygon)
-                    if crop is not None:
-                        text = recognizer.recognize(crop)
                 extracted.lines.append(
                     ExtractedLine(
                         polygon=[[float(x), float(y)] for x, y in polygon],
-                        text=text,
+                        text="",
                     )
                 )
+                if recognizer is not None:
+                    crop = crop_polygon_region(image, polygon)
+                    if crop is not None:
+                        slots.append((len(result_blocks), len(extracted.lines) - 1))
+                        crops.append(crop)
             result_blocks.append(extracted)
+
+        # Every crop goes through the recognizer at once so a batching
+        # recognizer can fill a single forward pass instead of one per line.
+        if recognizer is not None and crops:
+            for (block_index, line_index), text in zip(slots, _recognize_all(recognizer, crops)):
+                result_blocks[block_index].lines[line_index].text = text
 
         return PageResult(
             source=source,

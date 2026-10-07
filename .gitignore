@@ -8,8 +8,15 @@ models/*.onnx
 # Local user config (may contain API keys)
 translate_config.json
 
+# Local performance settings (per machine / GPU)
+engine_config.json
+
 # Local scratch / outputs
 _scratch/
 .ref/
 out/
 *.vis.png
+
+# PyInstaller build artifacts
+build/
+dist/

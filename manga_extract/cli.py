@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
-from .detector import ComicTextDetector
+from .detector import ComicTextDetector, available_devices
 from .image_io import find_images, imread, imwrite
 from .pipeline import MangaExtractor
 from .recognizer import DEFAULT_MODEL, MangaOcrRecognizer
@@ -54,6 +54,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Channel order fed to the detector model (default: bgr).",
     )
     parser.add_argument(
+        "--device", choices=available_devices(), default="auto",
+        help="Inference backend: 'auto' prefers GPU/accelerator (CUDA, DirectML, "
+             "OpenVINO) and falls back to CPU (default: auto).",
+    )
+    parser.add_argument(
+        "--threads", type=int, default=0,
+        help="CPU threads for detection and OCR; 0 lets each backend pick (default: 0).",
+    )
+    parser.add_argument(
+        "--ocr-batch", type=int, default=1,
+        help="Text lines recognized per forward pass; higher is faster on a "
+             "multi-core CPU (default: 1).",
+    )
+    parser.add_argument(
         "--no-ocr", action="store_true",
         help="Only detect/order text regions; skip OCR and leave text empty.",
     )
@@ -78,11 +92,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("error: no images found", file=sys.stderr)
         return 2
 
-    detector = ComicTextDetector(args.model, channel_order=args.channel_order)
+    detector = ComicTextDetector(
+        args.model, channel_order=args.channel_order,
+        device=args.device, threads=args.threads,
+    )
     recognizer = None
     if not args.no_ocr:
         recognizer = MangaOcrRecognizer(
-            model_name=args.ocr_model, hf_endpoint=args.hf_endpoint
+            model_name=args.ocr_model,
+            hf_endpoint=args.hf_endpoint,
+            device=args.device,
+            threads=args.threads,
+            batch_size=args.ocr_batch,
         )
     extractor = MangaExtractor(detector=detector, recognizer=recognizer)
 

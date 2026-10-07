@@ -190,10 +190,16 @@ def _try_merge_line(block: TextBlock, other: TextBlock, fntsize_tol: float = 1.3
     n1, n2 = len(block.lines), len(other.lines)
     fntsz_avg = (block.font_size * n1 + other.font_size * n2) / (n1 + n2)
 
-    vec_prod = float(block.vec @ other.vec)
-    vec_sum = block.vec + other.vec
+    # Filled in by _examine_block; without them the geometry is unknown.
+    vec, other_vec = block.vec, other.vec
+    block_distance, other_distance = block.distance, other.distance
+    if vec is None or other_vec is None or block_distance is None or other_distance is None:
+        return False
+
+    vec_prod = float(vec @ other_vec)
+    vec_sum = vec + other_vec
     cos_vec = vec_prod / max(block.norm * other.norm, 1e-9)
-    distance = float(other.distance[-1] - block.distance[-1])
+    distance = float(other_distance[-1] - block_distance[-1])
     distance_p1 = float(
         np.linalg.norm(np.asarray(other.lines[-1][0]) - np.asarray(block.lines[-1][0]))
     )
@@ -212,7 +218,7 @@ def _try_merge_line(block: TextBlock, other: TextBlock, fntsize_tol: float = 1.3
     if block.vertical:
         block.angle -= 90
     block.norm = float(np.linalg.norm(vec_sum))
-    block.distance = np.append(block.distance, other.distance[-1])
+    block.distance = np.append(block_distance, other_distance[-1])
     block.font_size = fntsz_avg
     other.merged = True
     return True
@@ -221,7 +227,7 @@ def _try_merge_line(block: TextBlock, other: TextBlock, fntsize_tol: float = 1.3
 def _merge_lines(block_list: List[TextBlock]) -> List[TextBlock]:
     if len(block_list) < 2:
         return block_list
-    block_list = sorted(block_list, key=lambda b: b.distance[0])
+    block_list = sorted(block_list, key=lambda b: b.distance[0] if b.distance is not None else 0.0)
     merged: List[TextBlock] = []
     for i, current in enumerate(block_list):
         if current.merged:
@@ -237,6 +243,8 @@ def _merge_lines(block_list: List[TextBlock]) -> List[TextBlock]:
 def _split_block(block: TextBlock) -> Tuple[bool, List[TextBlock]]:
     """Split a block when consecutive lines are separated by a large gap."""
     font_size, distance = block.font_size, block.distance
+    if distance is None:  # no per-line distances yet, so nothing to compare
+        return False, [block]
     first = np.array(block.lines[0])
     lines = sorted(block.lines, key=lambda ln: float(np.linalg.norm(np.array(ln[0]) - first[0])))
 
