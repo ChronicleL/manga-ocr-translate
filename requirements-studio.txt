@@ -1,0 +1,15 @@
+# Manga Studio (PySide6 front end) -- install AFTER requirements.txt, in two steps:
+#
+#   pip install -r requirements-studio.txt
+#   pip install --no-deps PySide6-Fluent-Widgets PySideSix-Frameless-Window
+#
+# Why two steps: PySide6-Fluent-Widgets declares a dependency on the full
+# "PySide6" meta package, which drags in PySide6-Addons (QtWebEngine & co., several
+# hundred MB). The studio only needs the Essentials modules, so the Fluent
+# packages are installed with --no-deps and their small real dependencies are
+# listed here.
+#
+# Licensing: PySide6-Fluent-Widgets is GPLv3 (PySideSix-Frameless-Window is LGPLv3).
+PySide6-Essentials>=6.8
+pywin32; sys_platform == "win32"
+darkdetect

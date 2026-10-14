@@ -2,7 +2,83 @@
 
 日文漫画文字提取（OCR）工具。按照日文漫画的阅读习惯——**纵向排版、从右到左、从上到下**——检测并识别页面中的文字，输出带顺序和坐标的结果，为后续翻译流程提供输入。
 
-当前已完成：**文字检测 + 阅读顺序 + 文字识别**，并提供**悬浮窗截图提取**工具。
+当前已完成：**文字检测 + 阅读顺序 + 文字识别**、**翻译与译文叠图**，以及面向整话汉化的
+**[Manga Studio 汉化工作台](#manga-studio汉化工作台)**（推荐）；另有命令行和旧版悬浮窗截图工具。
+
+## Manga Studio（汉化工作台）
+
+个人汉化用的桌面工作台：导入整话页面，识别、翻译、逐块校对，在原图和叠图之间随时切换，成果存在项目文件夹里，最后整话导出。
+
+```powershell
+.\run_studio.bat                       # 双击也行（无控制台窗口）
+.\.venv\Scripts\python.exe run_studio.py
+.\.venv\Scripts\python.exe -m manga_extract.studio
+```
+
+安装见下文「安装」（需要多装一步 PySide6 相关依赖）。
+
+### 界面
+
+```
+┌ 命令栏：新建/打开项目 | 导入▾ 截图 网页 识别▾ 导出▾ ……… 设置 主题 ┐
+├ 页面列表 ┬─────────── 画布 ───────────┬──── 校对栏 ─────┤
+│ 缩略图 + │  缩放 / 平移 / 文本块框      │ #1 竖排  ☑已校对 │
+│ 状态点   │                             │ 原文 ……          │
+│ 拖动排序 │  ╭ 翻译▾ │ 叠图 │ 框 │ 缩放 ╮│ 译文 ……          │
+└──────────┴─────────────────────────────┴──────────────────┘
+```
+
+* **页面列表**：每页一个状态点（未识别 / 排队中 / 识别中 / 已识别 / 已翻译 / 已校对），可拖动排序、右键重新识别或删除。
+* **画布**：Ctrl+滚轮缩放，拖动平移，双击适应窗口，点文本块框选中它。底部的悬浮栏有「翻译」菜单、**叠图 ⇄ 原图**切换（也可按空格）、文本框开关和缩放。
+* **校对栏**：每个文本块一张卡片，按阅读顺序排列，可直接改原文和译文、勾选「已校对」、单块重新翻译。点画布上的框或点卡片会**互相定位**。改动约 1 秒后自动保存，叠图随译文改动自动刷新。
+
+### 工作流
+
+1. **新建项目**：选一个文件夹，一话一个项目。
+2. **导入页面**（导入后默认自动识别，可在「识别」菜单关闭）
+   * 导入 → 图片文件 / 文件夹 / 剪贴板图片（`Ctrl+V`），也可以把文件拖进窗口。
+   * **截图**：隐藏窗口，冻结屏幕，框选区域（比如浏览器里的漫画页）；每块屏幕一个遮罩，多显示器和不同缩放比例都能对上像素。
+   * **网页**：粘贴章节网址，列出页面里的图片（缩略图、尺寸、大小），按宽度自动勾选、可全选或全不选，确认后按网页顺序导入。下载时带 `Referer`（默认是网页地址，防盗链失败时可改后点「重新加载图片」）。支持懒加载属性（`data-src` 等）、`srcset`、`<picture>`、`<noscript>`、`<base href>`；**不支持**用 JavaScript 动态生成图片列表或需要登录的站点（改用截图或先另存）。
+3. **翻译**：浮动栏「翻译」菜单 → 本页 / 全部页面 / 只翻译还没有译文的页面，并在同一个菜单里选**翻译通道**（谷歌、有道、MyMemory，或已配置的 AI 接口）。AI 接口在「设置」里配置。
+4. **校对**：逐块修改。**机翻永远不会覆盖你的劳动成果**：已勾选「已校对」或你手写过的译文会被跳过；只有你在某一块上点它自己的刷新按钮才会强制重译（已校对的块除外）。
+5. **导出**：「导出」菜单 → 整话图片（PNG / JPG，按页面顺序编号 `001.png`…；没有译文的页面可选择带上原图保持页码完整）、当前页、文本（原文 + 译文）、JSON（含坐标与校对状态）。
+
+### 快捷键
+
+| 键 | 作用 | 键 | 作用 |
+| --- | --- | --- | --- |
+| `Ctrl+N` / `Ctrl+O` | 新建 / 打开项目 | `Ctrl+T` / `Ctrl+Shift+T` | 翻译本页 / 全部页面 |
+| `Ctrl+I` | 导入图片文件 | `Ctrl+E` | 导出整话图片 |
+| `Ctrl+V` | 粘贴剪贴板图片（页面列表、画布上） | `Ctrl+,` | 设置 |
+| `Ctrl+Shift+S` | 截图 | `F5` | 识别当前页 |
+| `Alt+←` / `Alt+→` | 上一页 / 下一页 | `Alt+↑` / `Alt+↓` | 上 / 下一个文本块（光标进入译文框） |
+| `Ctrl+Enter` | 标记当前块已校对并跳到下一块（再按取消） | `Ctrl+B` | 显示 / 隐藏文本块框 |
+| `空格` | 原图 ⇄ 叠图（焦点在画布时） | | |
+
+窗口级快捷键避开了文本框自己用的编辑键，在校对框里打字不受影响。
+
+### 项目文件夹
+
+```
+第12话/
+├─ project.json        # 名称、目标语言、页面顺序
+├─ pages/001.png …     # 导入时复制进来的原图
+└─ data/001.json …     # 每页：文本块的坐标、原文、译文、已校对 / 手改标记
+```
+
+页面按编号命名、不随外部文件移动而丢失；数据文件原子写入，中途崩溃不会留下写了一半的 JSON。
+
+### 设置
+
+「设置」窗口分三块：普通翻译（引擎、目标语言、**测试机翻**）、AI 翻译（多套 OpenAI 兼容接口预设，名称 / 地址 / API Key / 模型 / 随机性 / 关闭思考模式 / 风格提示词，**测试 AI**）、性能（执行后端、CPU 线程、OCR 批处理；改动后自动重新加载模型）。设置写在程序目录下的 `translate_config.json`（可能含 API Key）和 `engine_config.json`，与旧版悬浮窗共用；窗口状态、主题、最近项目写在 `studio_config.json`（三者都已 gitignore）。
+
+### 检查安装
+
+```powershell
+.\.venv\Scripts\python.exe run_studio.py --selftest result.txt
+```
+
+启动后等识别模型加载完成，把结论写进 `result.txt`（`OK 检测 Dml · OCR cpu` 或 `FAIL 原因`）并以 0 / 1 退出，不需要点任何东西，也可配合 `set QT_QPA_PLATFORM=offscreen` 无界面运行。打包脚本用它做发布前的冒烟检查。
 
 ## 功能
 
@@ -24,9 +100,16 @@
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# Manga Studio 额外依赖（分两步，原因见 requirements-studio.txt 开头的说明）
+.\.venv\Scripts\python.exe -m pip install -r requirements-studio.txt
+.\.venv\Scripts\python.exe -m pip install --no-deps PySide6-Fluent-Widgets PySideSix-Frameless-Window
 ```
 
-> GUI 悬浮窗依赖 [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter)，已包含在 `requirements.txt` 中，命令行模式不需要它。
+* 分两步是因为 `PySide6-Fluent-Widgets` 声明依赖完整版 `PySide6`，会连带下载几百 MB 的 QtWebEngine；Studio 只需要 `PySide6-Essentials`，所以那个包用 `--no-deps` 安装。
+* 旧版悬浮窗依赖 [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter)，已包含在 `requirements.txt` 中；命令行模式和 Studio 都不需要它。
+* **Anaconda 的 Python**：conda 自带的 `icuuc.dll` 与 Qt 6.12 需要的符号不兼容，直接导入 PySide6 会报 `DLL load failed … 找不到指定的程序`。Studio 启动时会先预加载系统自带的那份来绕开（见 `manga_extract/studio/bootstrap.py`），不需要手动处理；用 python.org 的 Python 则没有这个问题。
+* 许可证：`PySide6-Fluent-Widgets` 是 GPLv3，`PySideSix-Frameless-Window` 是 LGPLv3，对外分发前请留意。
 
 ### 下载检测模型
 
@@ -96,7 +179,9 @@ GUI 里对应在「翻译设置 → 性能」一栏：**执行后端 / CPU 线�
 
 > 注意：`pip install -r requirements.txt` 会把带 GPU 支持的 onnxruntime 换回 CPU 版；重装依赖后需再装一次上面的 GPU 包。
 
-### 悬浮窗工具（截图提取）
+### 悬浮窗工具（旧版，截图提取）
+
+> 这是最初的小工具，仍可使用。整话汉化请用上面的 **Manga Studio**，它在这个工具的基础上增加了项目、画布、校对栏、网页导入和整话导出。
 
 一个置顶的小悬浮窗，像截图工具一样框选屏幕上的图片，直接出文字。
 
@@ -256,18 +341,57 @@ manga_extract/
 │  ├─ translation.py    # 翻译通道（谷歌/有道/MyMemory + OpenAI 兼容 AI）
 │  ├─ typeset.py        # 译文叠图：把译文按原文位置排版回图片
 │  ├─ pipeline.py       # 检测 → 分组排序 → 识别
+│  ├─ runtime.py        # 性能设置（后端 / 线程 / OCR 批处理）
 │  ├─ visualize.py      # 调试图绘制
 │  ├─ image_io.py       # 支持中文/日文路径的读写
 │  ├─ cli.py            # 命令行入口
-│  └─ gui/              # 悬浮窗截图工具
-│     ├─ app.py         #   主窗口、识别 / 翻译 / 叠图流程
-│     └─ capture.py     #   全屏截图与框选遮罩
-├─ run_gui.py           # 悬浮窗启动脚本
-├─ run_gui.bat          # 双击启动（无控制台窗口）
+│  ├─ gui/              # 旧版悬浮窗截图工具（customtkinter）
+│  └─ studio/           # Manga Studio（PySide6 + Fluent 风格）
+│     ├─ app.py           #   入口：Splash、主题、--selftest、退出
+│     ├─ bootstrap.py     #   启动垫片（Anaconda 的 ICU 冲突）
+│     ├─ main_window.py   #   命令栏、三栏工作区、各流程的编排
+│     ├─ project.py       #   项目文件夹模型（纯 Python，可单测）
+│     ├─ canvas.py        #   缩放 / 平移 / 文本块框 / 原图⇄叠图
+│     ├─ floating_bar.py  #   画布上的悬浮栏（翻译菜单、叠图、缩放）
+│     ├─ pages_panel.py   #   左栏：页面缩略图与状态
+│     ├─ blocks_panel.py  #   右栏：校对卡片
+│     ├─ workers.py       #   识别队列（单线程）与翻译线程
+│     ├─ overlay.py       #   后台渲染叠图（防抖，只渲染最新版本）
+│     ├─ capture_qt.py    #   截图遮罩（每块屏幕一个，按物理像素裁剪）
+│     ├─ web_import.py    #   网页图片提取与下载（纯标准库）
+│     ├─ web_worker.py    #   后台下载线程池
+│     ├─ web_dialog.py    #   网页导入对话框
+│     ├─ settings_dialog.py / settings_text.py   # 设置窗口及其帮助文案
+│     ├─ export.py / export_dialog.py            # 整话导出
+│     ├─ shortcuts.py     #   快捷键总表（菜单提示也引用它）
+│     ├─ selftest.py      #   --selftest
+│     └─ config.py / ui_common.py / imaging.py
+├─ tests/               # 单元测试与集成测试（不加载模型）
+├─ run_studio.py / run_studio.bat   # 启动 Manga Studio
+├─ run_gui.py / run_gui.bat         # 启动旧版悬浮窗
+├─ manga_studio.spec / manga_ocr_translate.spec   # PyInstaller 配置
+├─ packaging/           # 打包脚本与随包说明
 ├─ scripts/download_models.py
 ├─ models/              # 模型权重（已 gitignore）
-└─ requirements.txt
+└─ requirements.txt / requirements-studio.txt / requirements-build.txt
 ```
+
+## 测试
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests
+```
+
+不加载任何模型：识别用假引擎，翻译用假翻译器，网页导入对着本地起的假网站（强制 Referer、重定向、超时、把 HTML 当图片返回等）。界面测试用 Qt 的离屏平台，不需要显示器。部分用例需要 `samples/` 里的示例图和一个中文字体，缺少时会自动跳过。
+
+## 打包（Windows）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build_release.ps1            # Manga Studio
+powershell -ExecutionPolicy Bypass -File packaging\build_release.ps1 -App legacy # 旧版悬浮窗
+```
+
+脚本会安装 PyInstaller（`requirements-build.txt`）、打包、对 Studio 用 `--selftest` 做冒烟检查（失败则不生成发布包），最后压缩成 `dist\MangaStudio-win64.zip`。
 
 ## 阅读顺序说明
 

@@ -1,0 +1,2 @@
+# Only needed to build the Windows release (packaging/build_release.ps1).
+pyinstaller>=6.0

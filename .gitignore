@@ -11,6 +11,9 @@ translate_config.json
 # Local performance settings (per machine / GPU)
 engine_config.json
 
+# Local studio window state (theme, recent projects, geometry)
+studio_config.json
+
 # Local scratch / outputs
 _scratch/
 .ref/
