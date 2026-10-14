@@ -278,6 +278,67 @@ class NavigationTests(ImportHarness):
         self.assertTrue(window.blocks_panel.card(0).review_box.isChecked())
         self.assertEqual(window.canvas.view.selected_block, 1)
 
+    # -- review all ----------------------------------------------------------------
+    def test_review_all_ticks_every_text_block_of_the_page(self):
+        window = self.ready()
+        window.blocks_panel.review_all_button.click()                         # the real button
+        data = window._data[self.ids[0]]
+        texty = [block for block in data.blocks if block.has_text]
+        self.assertEqual(len(texty), 2)
+        self.assertTrue(all(block.reviewed for block in texty))
+        self.assertTrue(window.blocks_panel.card(0).review_box.isChecked())
+        self.assertTrue(window.blocks_panel.card(1).review_box.isChecked())
+        self.assertEqual(window.blocks_panel.progress.text(), "已校对 2/2")
+
+    def test_review_all_marks_the_page_reviewed_and_survives_a_save(self):
+        window = self.ready()
+        window.review_all_blocks()
+        self.assertEqual(window.pages._status[self.ids[0]], "reviewed")
+        window._flush_saves()
+        page = self.project.load_page(self.ids[0])
+        self.assertTrue(all(block.reviewed for block in page.blocks if block.has_text))
+
+    def test_a_second_review_all_clears_the_page_again(self):
+        window = self.ready()
+        window.review_all_blocks()
+        window.review_all_blocks()
+        data = window._data[self.ids[0]]
+        self.assertFalse(any(block.reviewed for block in data.blocks))
+        self.assertFalse(window.blocks_panel.card(0).review_box.isChecked())
+        self.assertEqual(window.blocks_panel.progress.text(), "已校对 0/2")
+        self.assertNotEqual(window.pages._status[self.ids[0]], "reviewed")
+
+    def test_review_all_leaves_a_block_without_text_alone(self):
+        window = self.ready()
+        data = window._data[self.ids[0]]
+        data.blocks[0].set_source("")
+        window.page_data_changed(self.ids[0])
+        window.review_all_blocks()
+        self.assertFalse(data.blocks[0].reviewed)
+        self.assertTrue(data.blocks[1].reviewed)
+        self.assertEqual(window.blocks_panel.progress.text(), "已校对 1/1")
+
+    def test_review_all_with_nothing_to_review_reports_instead_of_ticking(self):
+        window = self.ready()
+        data = window._data[self.ids[0]]
+        for block in data.blocks:
+            block.set_source("")
+        window.page_data_changed(self.ids[0])
+        window.review_all_blocks()
+        self.assertIn("没有可校对", window.status_left.text())
+        self.assertFalse(any(block.reviewed for block in data.blocks))
+
+    def test_review_all_does_nothing_without_a_project(self):
+        window = self.make_window(project=False)
+        window.review_all_blocks()                                            # must not raise
+        self.assertIsNone(window.project)
+
+    def test_the_shortcut_key_runs_the_bulk_review(self):
+        window = self.ready()
+        QTest.keyClick(window.pages.list, *key_of("Ctrl+Shift+Return"))
+        self.assertTrue(all(block.reviewed for block in window._data[self.ids[0]].blocks
+                            if block.has_text))
+
     # -- boxes ---------------------------------------------------------------------
     def test_ctrl_b_toggles_the_outlines_and_remembers_it(self):
         window = self.ready()

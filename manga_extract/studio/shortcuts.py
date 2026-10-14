@@ -33,6 +33,7 @@ SHORTCUTS: List[Shortcut] = [
     Shortcut("previous_block", "Alt+Up", "上一个文本块（光标进入译文框）"),
     Shortcut("next_block", "Alt+Down", "下一个文本块（光标进入译文框）"),
     Shortcut("review_and_next", "Ctrl+Return", "标记当前块已校对并跳到下一块"),
+    Shortcut("review_all_blocks", "Ctrl+Shift+Return", "把本页所有文本块标记为已校对（再按一次取消）"),
     Shortcut("toggle_boxes", "Ctrl+B", "显示 / 隐藏文本块框"),
 ]
 

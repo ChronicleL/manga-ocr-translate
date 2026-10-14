@@ -11,12 +11,15 @@ from qfluentwidgets import (
     CaptionLabel,
     CheckBox,
     FluentIcon as FIF,
+    PushButton,
     SmoothScrollArea,
     StrongBodyLabel,
     TextEdit,
     ToolTipFilter,
     TransparentToolButton,
 )
+
+from .shortcuts import hint
 
 MAX_EDIT_LINES = 8
 
@@ -160,6 +163,7 @@ class BlocksPanel(QWidget):
     sourceEdited = Signal(int, str)
     translationEdited = Signal(int, str)
     reviewedToggled = Signal(int, bool)
+    reviewAllRequested = Signal()
     retranslateRequested = Signal(int)
     cardSelected = Signal(int)          # user clicked / focused a card
 
@@ -177,6 +181,16 @@ class BlocksPanel(QWidget):
         header.addStretch(1)
         self.progress = CaptionLabel("", self)
         header.addWidget(self.progress)
+        # Bulk action for the "watched the overlay, everything is fine" case, so a page
+        # does not have to be ticked card by card.
+        self.review_all_button = PushButton("一键校对", self)
+        self.review_all_button.clicked.connect(lambda: self.reviewAllRequested.emit())
+        self.review_all_button.installEventFilter(ToolTipFilter(self.review_all_button))
+        self.review_all_button.setToolTip(
+            hint("把本页所有有文字的块都勾选为已校对；全部勾选后再按一次可全部取消",
+                 "review_all_blocks"))
+        self.review_all_button.setEnabled(False)
+        header.addWidget(self.review_all_button)
 
         self.hint = CaptionLabel("", self)
         self.hint.setWordWrap(True)
@@ -220,6 +234,7 @@ class BlocksPanel(QWidget):
         self.hint.setText(text)
         self.hint.setVisible(bool(text))
         self.progress.setText("")
+        self.review_all_button.setEnabled(False)
 
     def set_blocks(self, blocks: Sequence) -> None:
         """Rebuild the cards for a page. ``blocks`` are the live BlockData objects."""
@@ -288,6 +303,7 @@ class BlocksPanel(QWidget):
         done = sum(1 for card, block in zip(self._cards, self._blocks)
                    if block.has_text and card.review_box.isChecked())
         self.progress.setText(f"已校对 {done}/{total}" if total else "")
+        self.review_all_button.setEnabled(total > 0)
 
     def apply_theme(self, dark: bool, accent: QColor) -> None:
         self._dark, self._accent = dark, accent

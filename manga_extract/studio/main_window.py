@@ -405,6 +405,7 @@ class MainWindow(QMainWindow):
         self.blocks_panel.sourceEdited.connect(self._on_source_edited)
         self.blocks_panel.translationEdited.connect(self._on_translation_edited)
         self.blocks_panel.reviewedToggled.connect(self._on_reviewed_toggled)
+        self.blocks_panel.reviewAllRequested.connect(self.review_all_blocks)
         self.blocks_panel.retranslateRequested.connect(self._on_retranslate_block)
         self.blocks_panel.cardSelected.connect(self._on_card_selected)
         self.blocks_panel.show_message("导入页面并识别后，每个文本块的原文与译文会按阅读顺序显示在这里。")
@@ -510,6 +511,33 @@ class MainWindow(QMainWindow):
 
     def toggle_boxes(self) -> None:
         self.canvas.bar.boxes_button.toggle()
+
+    # -- bulk review -------------------------------------------------------------------
+    def review_all_blocks(self) -> None:
+        """Tick every text block of the current page, or clear them when all are ticked.
+
+        For the common "watched the overlay, it all looks right" pass: one click instead of
+        one click per card. Ticking protects the translations from machine re-translation
+        (see ``BlockData.wants_machine_translation``), so a second click clears the page again.
+        """
+        page_id = self.pages.current_id()
+        data = self._data.get(page_id)
+        if data is None:
+            return
+        texty = [block for block in data.blocks if block.has_text]
+        if not texty:
+            self.set_status("这一页没有可校对的文本块")
+            return
+        target = not all(block.reviewed for block in texty)
+        for block in texty:
+            block.reviewed = target
+        self._mark_dirty(page_id)                    # written out by the usual debounce
+        self.pages.update_status(page_id, data.status())
+        self.blocks_panel.refresh(data.blocks)
+        if target:
+            self.set_status(f"已把本页 {len(texty)} 个文本块全部标记为已校对")
+        else:
+            self.set_status(f"已取消本页 {len(texty)} 个文本块的校对标记")
 
     # -- export -----------------------------------------------------------------------
     def _ready_to_export(self) -> bool:

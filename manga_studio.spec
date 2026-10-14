@@ -20,6 +20,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [
     ("models/comic-text-detector.onnx", "models"),
+    ("assets/app.ico", "assets"),      # window / taskbar icon at run time
     ("README.md", "."),
     ("CHANGELOG.md", "."),
 ]
@@ -82,6 +83,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="MangaStudio",
+    icon="assets/app.ico",
     debug=False,
     console=False,
     disable_windowed_traceback=False,

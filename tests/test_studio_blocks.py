@@ -83,6 +83,29 @@ class BlocksPanelTests(unittest.TestCase):
         self.panel.refresh(self.blocks)
         self.assertEqual(self.panel.progress.text(), "已校对 1/2")
 
+    # -- bulk review --------------------------------------------------------
+    def test_review_all_button_asks_for_the_bulk_action(self):
+        self.panel.reviewAllRequested.connect(lambda: self.log.append(("review_all",)))
+        self.panel.review_all_button.click()
+        self.assertEqual(self.log[-1], ("review_all",))
+
+    def test_review_all_button_is_enabled_only_while_some_block_has_text(self):
+        self.assertTrue(self.panel.review_all_button.isEnabled())
+        from manga_extract.studio.project import BlockData
+
+        self.panel.set_blocks([BlockData(bbox=[0, 0, 10, 10], source="   ")])
+        self.assertFalse(self.panel.review_all_button.isEnabled())
+        self.panel.set_blocks(self.blocks)
+        self.assertTrue(self.panel.review_all_button.isEnabled())
+        self.panel.show_message("这一页没有检测到文字。")
+        self.assertFalse(self.panel.review_all_button.isEnabled())
+
+    def test_review_all_button_does_not_tick_anything_by_itself(self):
+        # The panel only asks; the model belongs to the window (progress stays untouched).
+        self.panel.review_all_button.click()
+        self.assertEqual(self.panel.progress.text(), "已校对 0/2")
+        self.assertFalse(any(block.reviewed for block in self.blocks))
+
     def test_no_blocks_shows_a_hint_instead_of_cards(self):
         self.panel.set_blocks([])
         self.assertEqual(self.panel.card_count(), 0)

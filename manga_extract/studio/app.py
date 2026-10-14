@@ -39,12 +39,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     prepare_windows_dlls()
 
     from PySide6.QtCore import Qt
-    from PySide6.QtGui import QFont
+    from PySide6.QtGui import QFont, QIcon
     from PySide6.QtWidgets import QApplication, QSplashScreen
 
     app = QApplication(argv if argv is not None else sys.argv)
     app.setApplicationName("MangaStudio")
     app.setFont(QFont("Microsoft YaHei UI", 9))
+
+    # Window and taskbar icon; the executable carries the same one (manga_studio.spec).
+    from .config import APP_ICON_PATH
+
+    if APP_ICON_PATH.is_file():
+        app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
 
     splash = QSplashScreen(_splash_pixmap(app.devicePixelRatio()),
                            Qt.WindowType.WindowStaysOnTopHint)

@@ -30,6 +30,7 @@ STUDIO_CONFIG_PATH = settings_root() / "studio_config.json"
 ENGINE_CONFIG_PATH = settings_root() / "engine_config.json"   # shared with the older GUI
 TRANSLATE_CONFIG_PATH = settings_root() / "translate_config.json"  # shared with the older GUI
 DETECTOR_MODEL_PATH = resource_root() / "models" / "comic-text-detector.onnx"
+APP_ICON_PATH = resource_root() / "assets" / "app.ico"
 
 
 @dataclass

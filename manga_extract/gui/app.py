@@ -60,8 +60,22 @@ def _settings_root() -> Path:
 
 RESOURCE_ROOT = _resource_root()
 DEFAULT_DETECTOR = RESOURCE_ROOT / "models" / "comic-text-detector.onnx"
+APP_ICON = RESOURCE_ROOT / "assets" / "app.ico"
 CONFIG_PATH = _settings_root() / "translate_config.json"
 ENGINE_CONFIG_PATH = _settings_root() / "engine_config.json"
+
+
+def apply_window_icon(window: tk.Misc) -> None:
+    """Give a Tk window the app icon (Windows only needs the .ico path).
+
+    A missing icon must never stop the program from starting, so failures are ignored.
+    """
+    if not APP_ICON.is_file():
+        return
+    try:
+        window.iconbitmap(default=str(APP_ICON))
+    except tk.TclError:
+        pass
 
 CARD_BG = "#ffffff"
 CARD_BORDER = "#e2e8f0"
@@ -1581,6 +1595,7 @@ def main(argv: Optional[List[str]] = None,
     enable_dpi_awareness()
     if root is None:
         root = ctk.CTk()
+    apply_window_icon(root)
     app = MangaExtractApp(  # noqa: F841
         root,
         model_path=args.model,

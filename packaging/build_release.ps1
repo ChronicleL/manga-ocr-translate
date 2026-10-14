@@ -76,7 +76,7 @@ Write-Host "== 压缩（约 1 GB，需要几分钟） =="
 Push-Location (Join-Path $root "dist")
 try {
     # Full path: a GNU tar earlier on PATH (Git Bash) would read "E:" as a remote host.
-    & (Join-Path $env:SystemRoot "System32	ar.exe") -a -c -f $zip $name
+    & (Join-Path $env:SystemRoot "System32\tar.exe") -a -c -f $zip $name
 } finally {
     Pop-Location
 }

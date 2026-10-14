@@ -14,6 +14,7 @@ Windows 桌面应用：导入漫画页 → 检测文字块 → 日文 OCR → �
   - `capture_qt.py`、`export.py`、`settings_dialog.py`、`shortcuts.py`（快捷键唯一来源）。
 - 旧版悬浮窗：`gui/`（customtkinter），暂时保留，不要在新功能里引用。
 - 项目文件夹格式：`project.json` + `pages/` + `data/*.json`。
+- 程序图标：`assets/app.ico`。两个版本的 exe 在 spec 里用 `icon=`，运行时窗口 / 任务栏图标也读它（Studio 走 `config.APP_ICON_PATH`，旧版走 `gui.app.apply_window_icon`），所以它必须随包分发（两个 spec 的 `datas` 里都有）。
 
 ## 环境与命令
 

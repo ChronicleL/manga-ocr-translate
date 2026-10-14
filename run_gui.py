@@ -70,6 +70,24 @@ ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
 _root = ctk.CTk()
+
+
+def _icon_path() -> Path:
+    """The bundled .ico, resolved without importing the heavy package."""
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    else:
+        base = Path(__file__).resolve().parent
+    return base / "assets" / "app.ico"
+
+
+_icon = _icon_path()
+if _icon.is_file():
+    try:
+        _root.iconbitmap(default=str(_icon))     # taskbar icon during start-up
+    except tk.TclError:
+        pass
+
 _root.overrideredirect(True)          # no title bar / borders
 _root.attributes("-topmost", True)
 _root.configure(fg_color="#1e293b")
