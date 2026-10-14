@@ -13,3 +13,6 @@ shapely>=2.0
 # Japanese OCR (pulls in torch + transformers). The default torch wheel is
 # CPU-only; OCR is only ~2s per page, so a CUDA build is usually not worth it.
 manga-ocr>=0.1.11
+
+# GUI (悬浮窗工具)
+customtkinter>=5.2

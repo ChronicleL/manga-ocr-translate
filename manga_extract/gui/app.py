@@ -19,9 +19,10 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 import cv2
+import customtkinter as ctk
 import numpy as np
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
 from PIL import Image, ImageGrab, ImageTk
 
 from ..detector import ComicTextDetector, available_devices
@@ -38,6 +39,11 @@ from ..typeset import TypesetError, build_translations_for_blocks, render_transl
 from ..visualize import draw_result
 from .capture import enable_dpi_awareness, select_region
 
+# Global CTk appearance (must be set before any CTk widget is created).
+ctk.set_appearance_mode("light")
+ctk.set_default_color_theme("blue")
+
+
 def _resource_root() -> Path:
     """Directory holding read-only bundled resources (``models/``)."""
     if getattr(sys, "frozen", False):
@@ -46,11 +52,7 @@ def _resource_root() -> Path:
 
 
 def _settings_root() -> Path:
-    """Writable directory for the user's config files.
-
-    When frozen this is the folder containing the executable, so settings live
-    next to the app instead of inside the read-only bundle.
-    """
+    """Writable directory for the user's config files."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[2]
@@ -61,15 +63,14 @@ DEFAULT_DETECTOR = RESOURCE_ROOT / "models" / "comic-text-detector.onnx"
 CONFIG_PATH = _settings_root() / "translate_config.json"
 ENGINE_CONFIG_PATH = _settings_root() / "engine_config.json"
 
-CARD_BG = "#f6f7f9"
-CARD_BORDER = "#c9ced6"
+CARD_BG = "#ffffff"
+CARD_BORDER = "#e2e8f0"
 THUMB_SIZE = 132
 FILE_TYPES = [
     ("图片", "*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff"),
     ("所有文件", "*.*"),
 ]
 
-# Presets for the AI model dropdown; the combobox itself stays editable.
 AI_MODEL_PRESETS = [
     "deepseek-chat",
     "deepseek-reasoner",
@@ -80,8 +81,6 @@ AI_MODEL_PRESETS = [
     "llama3.1",
 ]
 
-# Sample used by the two "测试" buttons. It deliberately carries some content
-# (rather than a bare greeting) so a style prompt has something to act on.
 TEST_SENTENCE = "おい、この魔剣は重すぎるだろ…！とても振れる気がしないんだが。"
 
 THINKING_HELP = (
@@ -123,9 +122,18 @@ PERF_HELP = (
     "改动在点「保存」后会自动重新加载模型。"
 )
 
+# Shared kwargs for secondary (ghost/outlined) CTkButtons.
+_BTN_SECONDARY: dict = dict(
+    fg_color="transparent",
+    border_width=1,
+    border_color=("#c8c8c8", "#4a4a4a"),
+    hover_color=("#ebebeb", "#3d3d3d"),
+    text_color=("gray10", "gray90"),
+    corner_radius=6,
+)
+
 
 def _parse_threads(value: str) -> int:
-    """Read a CPU-thread count; anything unparsable means 'auto' (0)."""
     try:
         return max(0, int(str(value).strip()))
     except ValueError:
@@ -133,12 +141,15 @@ def _parse_threads(value: str) -> int:
 
 
 def _parse_batch(value: str) -> int:
-    """Read an OCR batch size; anything unparsable means 1."""
     try:
         return max(1, int(str(value).strip()))
     except ValueError:
         return 1
 
+
+# ---------------------------------------------------------------------------
+# Tooltip
+# ---------------------------------------------------------------------------
 
 class HoverTip:
     """Show a small tooltip while the pointer rests on ``widget``."""
@@ -147,7 +158,7 @@ class HoverTip:
         self.widget = widget
         self.text = text
         self.wraplength = wraplength
-        self.tip: Optional[tk.Toplevel] = None
+        self.tip: Optional[ctk.CTkToplevel] = None
         widget.bind("<Enter>", self.show, add="+")
         widget.bind("<Leave>", self.hide, add="+")
         widget.bind("<Destroy>", self.hide, add="+")
@@ -155,14 +166,15 @@ class HoverTip:
     def show(self, _event: object = None) -> None:
         if self.tip is not None or not self.widget.winfo_exists():
             return
-        tip = tk.Toplevel(self.widget)
+        tip = ctk.CTkToplevel(self.widget)
         tip.overrideredirect(True)
         tip.attributes("-topmost", True)
-        tk.Label(tip, text=self.text, justify="left", wraplength=self.wraplength,
-                 background="#ffffe1", foreground="#333333", relief="solid",
-                 borderwidth=1, padx=8, pady=6).pack()
+        ctk.CTkLabel(
+            tip, text=self.text, justify="left", wraplength=self.wraplength,
+            fg_color="#1e293b", text_color="#f1f5f9", corner_radius=6,
+            padx=10, pady=8, font=ctk.CTkFont(size=11),
+        ).pack(padx=2, pady=2)
         tip.update_idletasks()
-        # Prefer the space above the widget, drop below it if there is none.
         x = max(0, self.widget.winfo_rootx() + self.widget.winfo_width()
                 - tip.winfo_reqwidth())
         y = self.widget.winfo_rooty() - tip.winfo_reqheight() - 6
@@ -176,6 +188,10 @@ class HoverTip:
             self.tip.destroy()
             self.tip = None
 
+
+# ---------------------------------------------------------------------------
+# Main application
+# ---------------------------------------------------------------------------
 
 class MangaExtractApp:
     """The floating window and its capture/extract workflow."""
@@ -198,8 +214,8 @@ class MangaExtractApp:
         self._pending: Optional[Dict] = None
         self._cards: List[Dict] = []
         self._thumb_refs: List[ImageTk.PhotoImage] = []
-        self._text_labels: List[tk.Label] = []
-        self._placeholder: Optional[tk.Label] = None
+        self._text_labels: list = []
+        self._placeholder: Optional[ctk.CTkLabel] = None
         self._not_ready = "正在加载模型…"
 
         self.config = TranslationConfig.load(CONFIG_PATH)
@@ -210,8 +226,8 @@ class MangaExtractApp:
         self._exporting_overlays = False
 
         root.title("漫画文字提取")
-        root.geometry("460x660+80+80")
-        root.minsize(360, 300)
+        root.geometry("480x680+80+80")
+        root.minsize(380, 320)
         root.attributes("-topmost", bool(topmost))
         self._topmost = tk.BooleanVar(value=bool(topmost))
 
@@ -222,85 +238,145 @@ class MangaExtractApp:
         root.after(80, self._poll)
 
     # -- UI construction -----------------------------------------------------
-    def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=6)
-        outer.pack(fill="both", expand=True)
 
-        bar = ttk.Frame(outer)
+    def _build_ui(self) -> None:
+        outer = ctk.CTkFrame(self.root, fg_color="transparent")
+        outer.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+
+        # --- Row 1: Primary capture actions ---
+        bar = ctk.CTkFrame(outer, fg_color="transparent")
         bar.pack(fill="x", pady=(0, 6))
 
-        self.btn_capture = ttk.Button(bar, text="截取", width=6,
-                                      command=self.on_capture, state="disabled")
+        self.btn_capture = ctk.CTkButton(
+            bar, text="截取", width=76, state="disabled",
+            command=self.on_capture, corner_radius=6,
+        )
         self.btn_capture.pack(side="left")
-        self.btn_clip = ttk.Button(bar, text="剪贴板", width=8,
-                                   command=self.on_clipboard, state="disabled")
-        self.btn_clip.pack(side="left", padx=(4, 0))
-        self.btn_open = ttk.Button(bar, text="打开图片", width=9,
-                                   command=self.on_open_file, state="disabled")
-        self.btn_open.pack(side="left", padx=(4, 0))
-        ttk.Checkbutton(bar, text="置顶", variable=self._topmost,
-                        command=self._toggle_topmost).pack(side="left", padx=(8, 0))
 
-        bar2 = ttk.Frame(outer)
+        self.btn_clip = ctk.CTkButton(
+            bar, text="剪贴板", width=92, state="disabled",
+            command=self.on_clipboard, **_BTN_SECONDARY,
+        )
+        self.btn_clip.pack(side="left", padx=(6, 0))
+
+        self.btn_open = ctk.CTkButton(
+            bar, text="打开图片", width=108, state="disabled",
+            command=self.on_open_file, **_BTN_SECONDARY,
+        )
+        self.btn_open.pack(side="left", padx=(6, 0))
+
+        ctk.CTkCheckBox(
+            bar, text="置顶", variable=self._topmost,
+            command=self._toggle_topmost, width=60,
+        ).pack(side="right")
+
+        # --- Row 2: Secondary actions ---
+        bar2 = ctk.CTkFrame(outer, fg_color="transparent")
         bar2.pack(fill="x", pady=(0, 6))
-        ttk.Button(bar2, text="复制全部", width=9, command=self.on_copy_all).pack(side="left")
-        ttk.Button(bar2, text="保存…", width=7, command=self.on_save).pack(side="left", padx=(4, 0))
-        ttk.Button(bar2, text="导出叠图…", width=10,
-                   command=self.on_export_overlays).pack(side="left", padx=(4, 0))
-        ttk.Button(bar2, text="清空", width=6, command=self.on_clear).pack(side="left", padx=(4, 0))
-        ttk.Button(bar2, text="翻译设置", width=9,
-                   command=self.open_settings).pack(side="left", padx=(4, 0))
 
-        bar3 = ttk.Frame(outer)
+        for text, width, cmd in [
+            ("复制全部", 90, self.on_copy_all),
+            ("保存…", 75, self.on_save),
+            ("导出叠图…", 100, self.on_export_overlays),
+            ("清空", 65, self.on_clear),
+            ("翻译设置", 90, self.open_settings),
+        ]:
+            ctk.CTkButton(bar2, text=text, width=width, command=cmd,
+                          **_BTN_SECONDARY).pack(side="left", padx=(0, 6))
+
+        # --- Row 3: Translation mode ---
+        bar3 = ctk.CTkFrame(outer, fg_color="transparent")
         bar3.pack(fill="x", pady=(0, 6))
-        ttk.Label(bar3, text="翻译：").pack(side="left")
-        self._web_radio = ttk.Radiobutton(bar3, text="普通", value="web",
-                                          variable=self._mode, command=self._on_mode_change)
-        self._web_radio.pack(side="left")
-        ttk.Radiobutton(bar3, text="AI", value="ai",
-                        variable=self._mode, command=self._on_mode_change).pack(side="left", padx=(4, 0))
-        ttk.Button(bar3, text="翻译全部", width=9,
-                   command=self.on_translate_all).pack(side="right")
 
-        # Scrollable log area.
-        body = ttk.Frame(outer)
-        body.pack(fill="both", expand=True)
+        ctk.CTkLabel(bar3, text="翻译：", fg_color="transparent").pack(side="left")
+        self._web_radio = ctk.CTkRadioButton(
+            bar3, text="普通", value="web", variable=self._mode,
+            command=self._on_mode_change,
+        )
+        self._web_radio.pack(side="left", padx=(4, 0))
+        ctk.CTkRadioButton(
+            bar3, text="AI", value="ai", variable=self._mode,
+            command=self._on_mode_change,
+        ).pack(side="left", padx=(10, 0))
+        ctk.CTkButton(
+            bar3, text="翻译全部", width=92, command=self.on_translate_all,
+            **_BTN_SECONDARY,
+        ).pack(side="right")
 
-        self.canvas = tk.Canvas(body, highlightthickness=0, bg="#ffffff")
-        vbar = ttk.Scrollbar(body, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=vbar.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        vbar.pack(side="right", fill="y")
-
-        self.log = ttk.Frame(self.canvas)
-        self._log_window = self.canvas.create_window((0, 0), window=self.log, anchor="nw")
-        self.log.bind("<Configure>",
-                      lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>", self._on_canvas_configure)
-        for widget in (self.canvas, self.log):
-            widget.bind("<MouseWheel>", self._on_mousewheel)
+        # --- Log: scrollable card list ---
+        self.log = ctk.CTkScrollableFrame(outer, fg_color="#f8fafc")
+        self.log.pack(fill="both", expand=True)
+        self.log.bind("<Configure>", self._on_log_configure)
 
         self._add_placeholder()
 
-        self.status = ttk.Label(self.root, anchor="w", relief="sunken", padding=(6, 2))
-        self.status.pack(fill="x", side="bottom")
+        # --- Status bar (two zones) ---
+        status_bar = ctk.CTkFrame(self.root, fg_color="#e2e8f0", corner_radius=0, height=28)
+        status_bar.pack(fill="x", side="bottom")
+        status_bar.pack_propagate(False)
+        self.status = ctk.CTkLabel(
+            status_bar, text="", anchor="w", fg_color="transparent",
+            text_color="#374151", font=ctk.CTkFont(size=11),
+        )
+        self.status.pack(side="left", fill="x", expand=True, padx=10)
+        self._backend_label = ctk.CTkLabel(
+            status_bar, text="", anchor="e", fg_color="transparent",
+            text_color="#6b7280", font=ctk.CTkFont(size=11),
+        )
+        self._backend_label.pack(side="right", padx=10)
 
         self._refresh_mode_labels()
 
+        # Windows: CTkScrollableFrame does not automatically receive <MouseWheel>
+        # events generated on child widgets.  Bind directly on the internal canvas
+        # so any wheel event anywhere in the log area scrolls the list.
+        self.root.bind_all("<MouseWheel>", self._on_global_mousewheel, add="+")
+
+    def _on_global_mousewheel(self, event: tk.Event) -> None:
+        """Route wheel events to the log scroll frame when the pointer is over it."""
+        try:
+            canvas = self.log._parent_canvas  # type: ignore[attr-defined]
+        except AttributeError:
+            return
+        # Only scroll the log when the pointer is actually inside the log area;
+        # leave other scrollable widgets (settings dialog comboboxes, textboxes)
+        # free to handle their own wheel events.
+        cx, cy = canvas.winfo_rootx(), canvas.winfo_rooty()
+        cw, ch = canvas.winfo_width(), canvas.winfo_height()
+        px, py = event.x_root, event.y_root
+        if cx <= px <= cx + cw and cy <= py <= cy + ch:
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
     def _add_placeholder(self) -> None:
-        label = tk.Label(
-            self.log, justify="left", anchor="nw", fg="#888888", bg="#ffffff",
-            text=("点「截取」后拖动鼠标框选图片区域，\n"
-                  "识别结果会一条条显示在这里。\n\n"
-                  "也可以用「剪贴板」粘贴 (Win+Shift+S) 截的图，\n"
-                  "或用「打开图片」选择本地文件。\n\n"
-                  "每个结果里的「翻译」按钮可翻译成中文，\n"
-                  "译文以「原文一句 / 译文一句」排列。"),
+        label = ctk.CTkLabel(
+            self.log,
+            justify="left",
+            anchor="nw",
+            text_color="#94a3b8",
+            fg_color="transparent",
+            text=(
+                "点「截取」后拖动鼠标框选图片区域，\n"
+                "识别结果会一条条显示在这里。\n\n"
+                "也可以用「剪贴板」粘贴 (Win+Shift+S) 截的图，\n"
+                "或用「打开图片」选择本地文件。\n\n"
+                "每个结果里的「翻译」按钮可翻译成中文，\n"
+                "译文以「原文一句 / 译文一句」排列。"
+            ),
+            font=ctk.CTkFont(size=12),
         )
-        label.pack(fill="x", padx=10, pady=10)
+        label.pack(fill="x", padx=14, pady=14)
         self._placeholder = label
 
+    # -- enable / disable input buttons ------------------------------------
+
+    def _set_capture_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        self.btn_capture.configure(state=state)
+        for button in (self.btn_clip, self.btn_open):
+            button.configure(state=state)
+
     # -- model loading -------------------------------------------------------
+
     def _load_models(self) -> None:
         try:
             if not self.model_path.is_file():
@@ -317,8 +393,6 @@ class MangaExtractApp:
             self.extractor = MangaExtractor(detector=detector, recognizer=recognizer)
             backend = detector.providers[0].replace("ExecutionProvider", "")
             if backend == "CPU":
-                # Make the silent fall-back visible: "auto" cannot use a GPU
-                # unless a GPU build of onnxruntime is installed.
                 backend += "（未启用 GPU 加速，检测会慢很多）"
             self.queue.put(("ready", f"检测 {backend}　·　OCR {recognizer.device}"))
         except Exception:
@@ -328,18 +402,20 @@ class MangaExtractApp:
         """Re-create the detector/recognizer after a performance change."""
         self.extractor = None
         self._not_ready = "正在加载模型…"
-        for button in (self.btn_capture, self.btn_clip, self.btn_open):
-            button.configure(state="disabled")
+        self._set_capture_enabled(False)
         self._set_status("正在加载模型…")
         threading.Thread(target=self._load_models, daemon=True).start()
 
     # -- event queue ---------------------------------------------------------
+
     def _poll(self) -> None:
         try:
             while True:
                 kind, payload = self.queue.get_nowait()
                 if kind == "ready":
                     self._on_ready(payload or "")
+                elif kind == "progress":
+                    self._on_progress(*payload)
                 elif kind == "result":
                     self._on_result(*payload)
                 elif kind == "error":
@@ -360,18 +436,26 @@ class MangaExtractApp:
         self.root.after(80, self._poll)
 
     def _on_ready(self, info: str = "") -> None:
-        for button in (self.btn_capture, self.btn_clip, self.btn_open):
-            button.configure(state="normal")
-        message = "就绪　·　点「截取」框选图片区域"
+        self._set_capture_enabled(True)
+        self._set_status("就绪　·　点「截取」框选图片区域")
         if info:
-            message += f"　·　{info}"
-        self._set_status(message)
+            self._backend_label.configure(text=info)
+
+    def _on_progress(self, stage: str, done: int, total: int) -> None:
+        if stage == "detect":
+            if total == 0:
+                self._set_status("检测完成，未发现文字")
+            else:
+                self._set_status(f"检测完成：{done} 块 / {total} 行　OCR 识别中…")
+        elif stage == "ocr":
+            self._set_status(f"OCR 识别中…　{done} / {total} 行")
 
     def _on_fatal(self, message: str) -> None:
         self._set_status("模型加载失败")
         messagebox.showerror("模型加载失败", message)
 
     # -- capture / input -----------------------------------------------------
+
     def _can_run(self) -> bool:
         if self.extractor is None:
             self._set_status(self._not_ready)
@@ -386,7 +470,7 @@ class MangaExtractApp:
             return
         self.root.withdraw()
         self.root.update_idletasks()
-        time.sleep(0.12)  # let the window disappear before the screen freezes
+        time.sleep(0.12)
         image: Optional[Image.Image] = None
         try:
             image = select_region(self.root)
@@ -433,6 +517,7 @@ class MangaExtractApp:
         self._start_extract(image)
 
     # -- extraction ----------------------------------------------------------
+
     def _start_extract(self, image: Image.Image) -> None:
         self._busy = True
         self._set_status("识别中…")
@@ -445,7 +530,11 @@ class MangaExtractApp:
             if extractor is None:
                 raise RuntimeError("模型尚未加载完成")
             bgr = _pil_to_bgr(image)
-            result = extractor.extract_page(bgr)
+
+            def on_progress(stage: str, done: int, total: int) -> None:
+                self.queue.put(("progress", (stage, done, total)))
+
+            result = extractor.extract_page(bgr, on_progress=on_progress)
             vis = draw_result(bgr, result)
             annotated = Image.fromarray(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
             self.queue.put(("result", (image, result, annotated)))
@@ -484,42 +573,69 @@ class MangaExtractApp:
         messagebox.showerror("识别失败", message)
 
     # -- log cards -----------------------------------------------------------
+
     def _add_pending_card(self, image: Image.Image) -> Dict:
         if self._placeholder is not None:
             self._placeholder.destroy()
             self._placeholder = None
 
-        frame = tk.Frame(self.log, bd=1, relief="solid", bg=CARD_BG,
-                         highlightbackground=CARD_BORDER, padx=6, pady=6)
-        frame.pack(fill="x", expand=True, padx=2, pady=(0, 6))
+        frame = ctk.CTkFrame(
+            self.log, fg_color=CARD_BG,
+            border_width=1, border_color=CARD_BORDER, corner_radius=8,
+        )
+        frame.pack(fill="x", padx=4, pady=(0, 8))
 
+        # Thumbnail uses tk.Label for direct PhotoImage compatibility.
         thumb_label = tk.Label(frame, bg=CARD_BG)
-        thumb_label.grid(row=0, column=0, rowspan=2, sticky="nw", padx=(0, 8))
+        thumb_label.grid(row=0, column=0, rowspan=2, sticky="nw", padx=(10, 8), pady=10)
         self._set_thumbnail_on(thumb_label, image, THUMB_SIZE)
 
-        text_label = tk.Label(frame, text="识别中…", anchor="nw", justify="left",
-                              bg=CARD_BG, wraplength=200)
-        text_label.grid(row=0, column=1, sticky="nwe")
+        text_label = ctk.CTkLabel(
+            frame, text="识别中…", anchor="nw", justify="left",
+            fg_color="transparent", text_color="#374151",
+            wraplength=200, font=ctk.CTkFont(size=12),
+        )
+        text_label.grid(row=0, column=1, sticky="nwe", pady=(10, 4), padx=(0, 8))
         self._text_labels.append(text_label)
 
-        buttons = tk.Frame(frame, bg=CARD_BG)
-        buttons.grid(row=1, column=1, sticky="sw", pady=(6, 0))
+        buttons = ctk.CTkFrame(frame, fg_color="transparent")
+        buttons.grid(row=1, column=1, sticky="sw", pady=(0, 10))
         card: Dict = {}
 
-        copy_btn = ttk.Button(buttons, text="复制", width=4, state="disabled",
-                              command=lambda: self._copy_text(self._card_display(card)))
+        copy_btn = ctk.CTkButton(
+            buttons, text="复制", width=56, state="disabled",
+            command=lambda: self._copy_text(self._card_display(card)),
+            **_BTN_SECONDARY,
+        )
         copy_btn.pack(side="left")
-        translate_btn = ttk.Button(buttons, text="翻译", width=6, state="disabled",
-                                   command=lambda: self.on_translate_card(card))
-        translate_btn.pack(side="left", padx=(4, 0))
-        overlay_btn = ttk.Button(buttons, text="叠图", width=4, state="disabled",
-                                 command=lambda: self._show_overlay(card))
-        overlay_btn.pack(side="left", padx=(4, 0))
-        toggle_btn = ttk.Button(buttons, text="显示原文", width=8,
-                                command=lambda: self._toggle_card_view(card))
-        detail_btn = ttk.Button(buttons, text="详情", width=4, state="disabled",
-                                command=lambda: self._show_detail(card))
-        detail_btn.pack(side="left", padx=(4, 0))
+
+        translate_btn = ctk.CTkButton(
+            buttons, text="翻译", width=68, state="disabled",
+            command=lambda: self.on_translate_card(card),
+            **_BTN_SECONDARY,
+        )
+        translate_btn.pack(side="left", padx=(6, 0))
+
+        overlay_btn = ctk.CTkButton(
+            buttons, text="叠图", width=56, state="disabled",
+            command=lambda: self._show_overlay(card),
+            **_BTN_SECONDARY,
+        )
+        overlay_btn.pack(side="left", padx=(6, 0))
+
+        # toggle_btn is packed later only after translation exists.
+        toggle_btn = ctk.CTkButton(
+            buttons, text="显示原文", width=90,
+            command=lambda: self._toggle_card_view(card),
+            **_BTN_SECONDARY,
+        )
+
+        detail_btn = ctk.CTkButton(
+            buttons, text="详情", width=56, state="disabled",
+            command=lambda: self._show_detail(card),
+            **_BTN_SECONDARY,
+        )
+        detail_btn.pack(side="left", padx=(6, 0))
 
         frame.columnconfigure(1, weight=1)
         card.update({
@@ -554,122 +670,128 @@ class MangaExtractApp:
         self._thumb_refs.append(photo)
         label.configure(image=photo)
 
-    def _show_detail(self, card: Dict) -> tk.Toplevel:
+    def _show_detail(self, card: Dict) -> ctk.CTkToplevel:
         result: Optional[PageResult] = card.get("result")
         annotated: Image.Image = card.get("annotated", card["image"])
-        win = tk.Toplevel(self.root)
+        win = ctk.CTkToplevel(self.root)
         win.title("识别详情")
         win.attributes("-topmost", True)
         win.geometry("760x680")
 
-        # 按钮栏先按 bottom 打包：内容超高时被压缩的是最后打包的文本框，
-        # 而不是按钮（否则按钮会被挤成 0 高度，看不见）。
-        actions = ttk.Frame(win)
-        actions.pack(side="bottom", fill="x", pady=(0, 8))
-        ttk.Button(actions, text="编辑…", width=8,
-                   command=lambda: self._open_editor(card, on_saved=render)).pack(side="left", padx=8)
-        ttk.Button(actions, text="关闭", width=8, command=win.destroy).pack(side="right", padx=8)
+        actions = ctk.CTkFrame(win, fg_color="transparent")
+        actions.pack(side="bottom", fill="x", pady=(0, 10))
+        ctk.CTkButton(
+            actions, text="编辑…", width=90,
+            command=lambda: self._open_editor(card, on_saved=render),
+            **_BTN_SECONDARY,
+        ).pack(side="left", padx=10)
+        ctk.CTkButton(actions, text="关闭", width=90, command=win.destroy,
+                      **_BTN_SECONDARY).pack(side="right", padx=10)
 
         preview = annotated.copy()
         preview.thumbnail((720, 420))
         photo = ImageTk.PhotoImage(preview)
-        self._thumb_refs.append(photo)
-        tk.Label(win, image=photo, bg="#ffffff").pack(fill="x", padx=8, pady=8)
+        img_label = tk.Label(win, image=photo, bg="#f8fafc")
+        img_label.photo = photo  # type: ignore[attr-defined]
+        img_label.pack(fill="x", padx=10, pady=10)
 
-        text = tk.Text(win, wrap="word", height=14)
-        text.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        text_box = ctk.CTkTextbox(win, wrap="word", height=280,
+                                   font=ctk.CTkFont(size=12))
+        text_box.pack(fill="both", expand=True, padx=10, pady=(0, 6))
 
         def render() -> None:
-            text.configure(state="normal")
-            text.delete("1.0", "end")
-            text.insert("1.0", _format_detail(card.get("result"), card.get("pairs")))
-            text.configure(state="disabled")
+            text_box.configure(state="normal")
+            text_box.delete("1.0", "end")
+            text_box.insert("1.0", _format_detail(card.get("result"), card.get("pairs")))
+            text_box.configure(state="disabled")
 
         render()
         return win
 
     def _open_editor(self, card: Dict,
-                     on_saved: Optional[Callable[[], None]] = None) -> Optional[tk.Toplevel]:
-        """Manually proofread the translation or fix mis-recognised text."""
+                     on_saved: Optional[Callable[[], None]] = None) -> Optional[ctk.CTkToplevel]:
         result: Optional[PageResult] = card.get("result")
         if result is None:
             self._set_status("还没有可编辑的结果")
             return None
 
-        win = tk.Toplevel(self.root)
+        win = ctk.CTkToplevel(self.root)
         win.title("手动校对")
         win.attributes("-topmost", True)
         win.geometry("780x640")
         win.transient(self.root)
 
-        # 同详情窗：按钮栏先按 bottom 打包，保证文本块很多时按钮不被挤掉。
-        actions = ttk.Frame(win)
+        actions = ctk.CTkFrame(win, fg_color="transparent")
         actions.pack(side="bottom", fill="x", pady=(10, 10))
-        ttk.Button(actions, text="保存修改", width=10,
-                   command=lambda: save()).pack(side="right", padx=(0, 12))
-        ttk.Button(actions, text="取消", width=8, command=win.destroy).pack(side="right")
+        ctk.CTkButton(actions, text="保存修改", width=100,
+                      command=lambda: save()).pack(side="right", padx=(0, 12))
+        ctk.CTkButton(actions, text="取消", width=90, command=win.destroy,
+                      **_BTN_SECONDARY).pack(side="right")
 
-        ttk.Label(
-            win, justify="left", foreground="#666", wraplength=740,
+        ctk.CTkLabel(
+            win, justify="left", text_color="#666", fg_color="transparent",
+            wraplength=740, font=ctk.CTkFont(size=11),
             text="直接修改识别结果（原文）或译文。保存后卡片显示、复制、保存、译文叠图都会用修改后的内容；"
                  "改过原文的文本块会合并成一行。",
-        ).pack(fill="x", padx=12, pady=(10, 6))
+        ).pack(fill="x", padx=14, pady=(10, 6))
 
-        area = ttk.Frame(win)
+        area = ctk.CTkScrollableFrame(win, fg_color="transparent")
         area.pack(fill="both", expand=True, padx=12)
-        canvas = tk.Canvas(area, highlightthickness=0)
-        vbar = ttk.Scrollbar(area, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        vbar.pack(side="right", fill="y")
-        inner = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>",
-                   lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
-
-        def on_wheel(event: "tk.Event") -> None:
-            canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
-
-        canvas.bind("<MouseWheel>", on_wheel)
-        inner.bind("<MouseWheel>", on_wheel)
 
         targets = {index: target for index, _src, target in (card.get("block_pairs") or [])}
         rows: List[tuple] = []
         for index, block in enumerate(result.blocks):
             x1, y1, x2, y2 = block.xyxy
             direction = "竖排" if block.vertical else "横排"
-            box = ttk.LabelFrame(inner, text=f"#{index}　{direction}　({x1},{y1})-({x2},{y2})",
-                                 padding=8)
+
+            box = ctk.CTkFrame(area, fg_color="#f8fafc", border_width=1,
+                                border_color="#e2e8f0", corner_radius=6)
             box.pack(fill="x", pady=(0, 6))
-            ttk.Label(box, text="原文").grid(row=0, column=0, sticky="nw")
-            src_entry = tk.Text(box, height=_editor_height(block.text), width=56, wrap="word")
-            src_entry.grid(row=0, column=1, sticky="we", padx=(8, 0))
+
+            header = ctk.CTkLabel(
+                box, text=f"#{index}　{direction}　({x1},{y1})-({x2},{y2})",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                fg_color="transparent", text_color="#374151", anchor="w",
+            )
+            header.pack(fill="x", padx=10, pady=(6, 2))
+
+            inner = ctk.CTkFrame(box, fg_color="transparent")
+            inner.pack(fill="x", padx=10, pady=(0, 8))
+
+            ctk.CTkLabel(inner, text="原文", fg_color="transparent",
+                         width=40, anchor="nw").grid(row=0, column=0, sticky="nw")
+            h_src = max(40, _editor_height(block.text) * 20)
+            src_box = ctk.CTkTextbox(inner, height=h_src, wrap="word",
+                                      font=ctk.CTkFont(size=12))
+            src_box.grid(row=0, column=1, sticky="we", padx=(8, 0))
             if block.text:
-                src_entry.insert("1.0", block.text)
+                src_box.insert("1.0", block.text)
 
-            tgt_entry = None
+            tgt_box = None
             if index in targets:
-                ttk.Label(box, text="译文").grid(row=1, column=0, sticky="nw", pady=(6, 0))
-                tgt_entry = tk.Text(box, height=_editor_height(targets[index]), width=56,
-                                    wrap="word")
-                tgt_entry.grid(row=1, column=1, sticky="we", padx=(8, 0), pady=(6, 0))
-                tgt_entry.insert("1.0", targets[index])
+                ctk.CTkLabel(inner, text="译文", fg_color="transparent",
+                             width=40, anchor="nw").grid(row=1, column=0,
+                                                         sticky="nw", pady=(6, 0))
+                h_tgt = max(40, _editor_height(targets[index]) * 20)
+                tgt_box = ctk.CTkTextbox(inner, height=h_tgt, wrap="word",
+                                          font=ctk.CTkFont(size=12))
+                tgt_box.grid(row=1, column=1, sticky="we", padx=(8, 0), pady=(6, 0))
+                tgt_box.insert("1.0", targets[index])
 
-            box.columnconfigure(1, weight=1)
-            rows.append((index, block, src_entry, tgt_entry))
+            inner.columnconfigure(1, weight=1)
+            rows.append((index, block, src_box, tgt_box))
 
         def save() -> None:
-            for _index, block, src_entry, _tgt in rows:
-                text = src_entry.get("1.0", "end").strip()
+            for _index, block, src_box, _tgt in rows:
+                text = src_box.get("1.0", "end").strip()
                 if text != block.text:
                     _rewrite_block_text(block, text)
 
             if card.get("block_pairs"):
-                # 与自动翻译一致：原文为空的块不参与配对
                 card["block_pairs"] = [
-                    (index, block.text, tgt_entry.get("1.0", "end").strip())
-                    for index, block, _src, tgt_entry in rows
-                    if tgt_entry is not None and block.text
+                    (index, block.text, tgt_box.get("1.0", "end").strip())
+                    for index, block, _src, tgt_box in rows
+                    if tgt_box is not None and block.text
                 ]
                 card["pairs"] = [(src, tgt) for _index, src, tgt in card["block_pairs"]]
                 card["overlay"] = None
@@ -684,6 +806,7 @@ class MangaExtractApp:
         return win
 
     # -- translation ---------------------------------------------------------
+
     @staticmethod
     def _engine_label(code: str) -> str:
         for label, value in WEB_ENGINES.items():
@@ -803,7 +926,7 @@ class MangaExtractApp:
             return
         card["pairs"] = pairs
         card["block_pairs"] = block_pairs
-        card["overlay"] = None  # invalidate cached preview
+        card["overlay"] = None
         card["show_original"] = False
         card["translate_btn"].configure(text="重新翻译", state="normal")
         card["overlay_btn"].configure(state="normal")
@@ -820,7 +943,6 @@ class MangaExtractApp:
         self._set_status(message)
 
     def _card_display(self, card: Dict) -> str:
-        """原文一句、译文一句（翻译后）；否则显示原文。"""
         pairs = card.get("pairs")
         if pairs and not card.get("show_original"):
             return "\n\n".join(f"{src}\n{tgt}" for src, tgt in pairs)
@@ -835,15 +957,16 @@ class MangaExtractApp:
             card["toggle_btn"].configure(
                 text="显示原文" if not card.get("show_original") else "显示译文")
             if not card["toggle_btn"].winfo_ismapped():
-                card["toggle_btn"].pack(side="left", padx=(4, 0), before=card["detail_btn"])
+                card["toggle_btn"].pack(
+                    side="left", padx=(6, 0), before=card["detail_btn"])
 
     def _toggle_card_view(self, card: Dict) -> None:
         card["show_original"] = not card.get("show_original", False)
         self._refresh_card(card)
 
     # -- translated-image overlay -------------------------------------------
-    def _show_overlay(self, card: Dict) -> Optional[tk.Toplevel]:
-        """Render the translation back onto the page and preview it."""
+
+    def _show_overlay(self, card: Dict) -> Optional[ctk.CTkToplevel]:
         result = card.get("result")
         block_pairs = card.get("block_pairs") or []
         if result is None or not block_pairs:
@@ -867,16 +990,42 @@ class MangaExtractApp:
             return None
         return self._open_image_window("译文叠图预览", preview, default_name="translated.png")
 
-    def _open_image_window(self, title: str, image: Image.Image, default_name: str) -> tk.Toplevel:
-        win = tk.Toplevel(self.root)
+    def _open_image_window(self, title: str, image: Image.Image, default_name: str) -> ctk.CTkToplevel:
+        win = ctk.CTkToplevel(self.root)
         win.title(title)
         win.attributes("-topmost", True)
 
-        display = image.copy()
-        display.thumbnail((1000, 760))
-        photo = ImageTk.PhotoImage(display)
-        self._thumb_refs.append(photo)
-        tk.Label(win, image=photo, bg="#2b2b2b").pack(padx=8, pady=8)
+        iw, ih = image.size
+        scale = min(960 / max(iw, 1), 700 / max(ih, 1), 1.0)
+        win.geometry(f"{max(440, int(iw * scale) + 20)}x{max(340, int(ih * scale) + 56)}")
+
+        img_area = ctk.CTkFrame(win, fg_color="#2b2b2b", corner_radius=0)
+        img_area.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+
+        img_label = tk.Label(img_area, bg="#2b2b2b")
+        img_label.pack(fill="both", expand=True)
+
+        _resize_job: List[Optional[str]] = [None]
+
+        def _do_resize() -> None:
+            if not img_area.winfo_exists():
+                return
+            w, h = img_area.winfo_width(), img_area.winfo_height()
+            if w < 20 or h < 20:
+                return
+            display = image.copy()
+            display.thumbnail((w, h), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(display)
+            img_label.configure(image=photo)
+            img_label.photo = photo  # type: ignore[attr-defined]
+            _resize_job[0] = None
+
+        def _on_resize(_event: object = None) -> None:
+            if _resize_job[0]:
+                win.after_cancel(_resize_job[0])
+            _resize_job[0] = win.after(80, _do_resize)
+
+        img_area.bind("<Configure>", _on_resize)
 
         def save() -> None:
             path = filedialog.asksaveasfilename(
@@ -892,70 +1041,82 @@ class MangaExtractApp:
                 return
             self._set_status(f"已保存到 {path}")
 
-        actions = ttk.Frame(win)
+        actions = ctk.CTkFrame(win, fg_color="transparent")
         actions.pack(fill="x", pady=(0, 8))
-        ttk.Button(actions, text="保存图片", width=10, command=save).pack(side="left", padx=8)
-        ttk.Button(actions, text="关闭", width=8, command=win.destroy).pack(side="right", padx=8)
+        ctk.CTkButton(actions, text="保存图片", width=100, command=save).pack(side="left", padx=8)
+        ctk.CTkButton(actions, text="关闭", width=90, command=win.destroy,
+                      **_BTN_SECONDARY).pack(side="right", padx=8)
         return win
+
+    # -- settings dialog -----------------------------------------------------
 
     def open_settings(self) -> None:
         self.config.ensure_profiles()
 
-        dlg = tk.Toplevel(self.root)
+        dlg = ctk.CTkToplevel(self.root)
         dlg.title("翻译设置")
         dlg.attributes("-topmost", True)
-        dlg.geometry("620x680")
-        dlg.minsize(560, 420)
+        dlg.geometry("640x700")
+        dlg.minsize(560, 440)
         dlg.transient(self.root)
 
-        # Fixed action bar at the bottom; the settings scroll above it so a long
-        # test result can never push the buttons or lower sections out of view.
-        actions = ttk.Frame(dlg, padding=(12, 0, 12, 12))
-        actions.pack(fill="x", side="bottom")
+        # Fixed action bar at the bottom.
+        actions = ctk.CTkFrame(dlg, fg_color="transparent")
+        actions.pack(fill="x", side="bottom", padx=12, pady=12)
 
-        area = ttk.Frame(dlg, padding=(12, 12, 12, 0))
-        area.pack(fill="both", expand=True)
-        canvas = tk.Canvas(area, highlightthickness=0)
-        vbar = ttk.Scrollbar(area, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        vbar.pack(side="right", fill="y")
+        # Scrollable content area.
+        body = ctk.CTkScrollableFrame(dlg, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=12, pady=(12, 0))
 
-        body = ttk.Frame(canvas)
-        body_window = canvas.create_window((0, 0), window=body, anchor="nw")
-        body.bind("<Configure>",
-                  lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>",
-                    lambda e: canvas.itemconfigure(body_window, width=e.width))
+        # ── helper: labelled section frame ───────────────────────────────
+        def section(parent: ctk.CTkScrollableFrame, title: str) -> ctk.CTkFrame:
+            card = ctk.CTkFrame(parent, fg_color="#f8fafc",
+                                border_width=1, border_color="#e2e8f0", corner_radius=8)
+            card.pack(fill="x", pady=(0, 10))
+            ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=13, weight="bold"),
+                         fg_color="transparent", text_color="#1e293b",
+                         anchor="w").pack(fill="x", padx=12, pady=(10, 4))
+            sep = ctk.CTkFrame(card, height=1, fg_color="#e2e8f0", corner_radius=0)
+            sep.pack(fill="x", padx=12, pady=(0, 8))
+            inner = ctk.CTkFrame(card, fg_color="transparent")
+            inner.pack(fill="x", padx=12, pady=(0, 12))
+            return inner
 
-        def on_wheel(event: "tk.Event") -> None:
-            if isinstance(event.widget, ttk.Combobox):
-                return  # let the combobox change its own selection
-            canvas.yview_scroll(int(-event.delta / 120), "units")
+        def row_label(parent: ctk.CTkFrame, text: str, r: int) -> None:
+            ctk.CTkLabel(parent, text=text, fg_color="transparent",
+                         text_color="#374151", anchor="w", width=80).grid(
+                row=r, column=0, sticky="w", pady=(0, 8))
 
-        dlg.bind("<MouseWheel>", on_wheel)
+        # ── 普通翻译 ─────────────────────────────────────────────────────
+        web_inner = section(body, "普通翻译（网页通道）")
+        web_inner.columnconfigure(1, weight=1)
 
-        # -- 普通翻译（网页通道） ------------------------------------------
-        web = ttk.LabelFrame(body, text="普通翻译（网页通道）", padding=10)
-        web.pack(fill="x")
-        ttk.Label(web, text="翻译引擎").grid(row=0, column=0, sticky="w")
+        row_label(web_inner, "翻译引擎", 0)
         engine_var = tk.StringVar(value=self._engine_label(self.config.web_engine))
-        ttk.Combobox(web, textvariable=engine_var, values=list(WEB_ENGINES.keys()),
-                     state="readonly", width=18).grid(row=0, column=1, sticky="w", padx=(8, 0))
-        ttk.Label(web, text="目标语言").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        lang_var = tk.StringVar(value=self._lang_label(self.config.target_lang))
-        ttk.Combobox(web, textvariable=lang_var, values=list(TARGET_LANGUAGES.keys()),
-                     state="readonly", width=18).grid(row=1, column=1, sticky="w",
-                                                      padx=(8, 0), pady=(6, 0))
-        web_result = tk.StringVar(value="")
-        ttk.Button(web, text="测试机翻", width=10,
-                   command=lambda: run_test("web")).grid(row=0, column=2, rowspan=2, padx=(14, 0))
-        ttk.Label(web, textvariable=web_result, foreground="#3a7", wraplength=500,
-                  justify="left").grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ctk.CTkComboBox(web_inner, variable=engine_var,
+                        values=list(WEB_ENGINES.keys()),
+                        state="readonly", width=200).grid(
+            row=0, column=1, sticky="w", padx=(8, 0), pady=(0, 8))
 
-        # -- AI 翻译（多套 API 预设） --------------------------------------
-        ai = ttk.LabelFrame(body, text="AI 翻译（OpenAI 兼容接口）", padding=10)
-        ai.pack(fill="x", pady=(10, 0))
+        row_label(web_inner, "目标语言", 1)
+        lang_var = tk.StringVar(value=self._lang_label(self.config.target_lang))
+        ctk.CTkComboBox(web_inner, variable=lang_var,
+                        values=list(TARGET_LANGUAGES.keys()),
+                        state="readonly", width=200).grid(
+            row=1, column=1, sticky="w", padx=(8, 0), pady=(0, 8))
+
+        web_result = tk.StringVar(value="")
+        ctk.CTkButton(web_inner, text="测试机翻", width=100,
+                      command=lambda: run_test("web")).grid(
+            row=0, column=2, rowspan=2, padx=(14, 0))
+        ctk.CTkLabel(web_inner, textvariable=web_result, text_color="#16a34a",
+                     fg_color="transparent", wraplength=500,
+                     justify="left").grid(row=2, column=0, columnspan=3,
+                                          sticky="w", pady=(0, 4))
+
+        # ── AI 翻译 ──────────────────────────────────────────────────────
+        ai_inner = section(body, "AI 翻译（OpenAI 兼容接口）")
+        ai_inner.columnconfigure(1, weight=1)
 
         profile_var = tk.StringVar()
         name_var = tk.StringVar(value=self.config.ai.name)
@@ -967,86 +1128,108 @@ class MangaExtractApp:
         ai_result = tk.StringVar(value="")
         state = {"index": 0}
 
-        ttk.Label(ai, text="接口配置").grid(row=0, column=0, sticky="w")
-        profile_box = ttk.Combobox(ai, textvariable=profile_var, state="readonly", width=30)
-        profile_box.grid(row=0, column=1, sticky="we", padx=(8, 0))
+        row_label(ai_inner, "接口配置", 0)
+        profile_box = ctk.CTkComboBox(ai_inner, variable=profile_var,
+                                       state="readonly", width=220)
+        profile_box.grid(row=0, column=1, sticky="we", padx=(8, 0), pady=(0, 8))
 
-        profile_actions = ttk.Frame(ai)
-        profile_actions.grid(row=0, column=2, sticky="w", padx=(6, 0))
-        ttk.Button(profile_actions, text="新增", width=6,
-                   command=lambda: add_profile()).pack(side="left")
-        ttk.Button(profile_actions, text="删除", width=6,
-                   command=lambda: delete_profile()).pack(side="left", padx=(4, 0))
+        prof_btns = ctk.CTkFrame(ai_inner, fg_color="transparent")
+        prof_btns.grid(row=0, column=2, sticky="w", padx=(8, 0), pady=(0, 8))
+        ctk.CTkButton(prof_btns, text="新增", width=60,
+                      command=lambda: add_profile(), **_BTN_SECONDARY).pack(side="left")
+        ctk.CTkButton(prof_btns, text="删除", width=60,
+                      command=lambda: delete_profile(),
+                      **_BTN_SECONDARY).pack(side="left", padx=(6, 0))
 
-        ttk.Label(ai, text="名称").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(ai, textvariable=name_var, width=34).grid(row=1, column=1, sticky="we",
-                                                            padx=(8, 0), pady=(6, 0))
-        ttk.Label(ai, text="接口地址").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(ai, textvariable=base_var, width=34).grid(row=2, column=1, sticky="we",
-                                                            padx=(8, 0), pady=(6, 0))
-        ttk.Label(ai, text="API Key").grid(row=3, column=0, sticky="w", pady=(6, 0))
-        key_entry = ttk.Entry(ai, textvariable=key_var, width=34, show="•")
-        key_entry.grid(row=3, column=1, sticky="we", padx=(8, 0), pady=(6, 0))
-        show_key = tk.BooleanVar(value=False)
-        ttk.Checkbutton(ai, text="显示", variable=show_key,
-                        command=lambda: key_entry.configure(show="" if show_key.get() else "•"),
-                        ).grid(row=3, column=2, sticky="w", padx=(6, 0), pady=(6, 0))
-        ttk.Label(ai, text="模型").grid(row=4, column=0, sticky="w", pady=(6, 0))
-        ttk.Combobox(ai, textvariable=model_var, values=AI_MODEL_PRESETS,
-                     width=32).grid(row=4, column=1, sticky="we", padx=(8, 0), pady=(6, 0))
-        ttk.Label(ai, text="随机性").grid(row=5, column=0, sticky="w", pady=(6, 0))
-        temp_row = ttk.Frame(ai)
-        temp_row.grid(row=5, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(6, 0))
-        ttk.Entry(temp_row, textvariable=temp_var, width=10).pack(side="left")
-        think_check = ttk.Checkbutton(temp_row, text="关闭思考模式（更快）", variable=think_var)
+        for r, (lbl, var, is_key) in enumerate([
+            ("名称", name_var, False),
+            ("接口地址", base_var, False),
+            ("API Key", key_var, True),
+        ], start=1):
+            row_label(ai_inner, lbl, r)
+            ent = ctk.CTkEntry(ai_inner, textvariable=var, width=280,
+                                show="•" if is_key else "")
+            ent.grid(row=r, column=1, sticky="we", padx=(8, 0), pady=(0, 8))
+            if is_key:
+                show_key = tk.BooleanVar(value=False)
+                ctk.CTkCheckBox(ai_inner, text="显示", variable=show_key, width=70,
+                                command=lambda e=ent, v=show_key: e.configure(
+                                    show="" if v.get() else "•")).grid(
+                    row=r, column=2, sticky="w", padx=(8, 0), pady=(0, 8))
+
+        row_label(ai_inner, "模型", 4)
+        ctk.CTkComboBox(ai_inner, variable=model_var, values=AI_MODEL_PRESETS,
+                        width=280).grid(row=4, column=1, sticky="we",
+                                        padx=(8, 0), pady=(0, 8))
+
+        row_label(ai_inner, "随机性", 5)
+        temp_row = ctk.CTkFrame(ai_inner, fg_color="transparent")
+        temp_row.grid(row=5, column=1, columnspan=2, sticky="w",
+                      padx=(8, 0), pady=(0, 8))
+        ctk.CTkEntry(temp_row, textvariable=temp_var, width=90).pack(side="left")
+        think_check = ctk.CTkCheckBox(temp_row, text="关闭思考模式（更快）",
+                                       variable=think_var)
         think_check.pack(side="left", padx=(14, 0))
-        temp_help = ttk.Button(temp_row, text="?", width=2, cursor="question_arrow")
-        temp_help.pack(side="left", padx=(6, 0))
-        temp_help.configure(command=HoverTip(temp_help, TEMPERATURE_HELP).show)
         HoverTip(think_check, THINKING_HELP)
-        ttk.Label(ai, text="提示词").grid(row=6, column=0, sticky="nw", pady=(6, 0))
-        prompt_text = tk.Text(ai, height=4, width=34, wrap="word")
-        prompt_text.grid(row=6, column=1, sticky="we", padx=(8, 0), pady=(6, 0))
+        temp_help = ctk.CTkButton(temp_row, text="?", width=30,
+                                   cursor="question_arrow", **_BTN_SECONDARY)
+        temp_help.pack(side="left", padx=(8, 0))
+        temp_help.configure(command=HoverTip(temp_help, TEMPERATURE_HELP).show)
+
+        row_label(ai_inner, "提示词", 6)
+        prompt_text = ctk.CTkTextbox(ai_inner, height=80, wrap="word",
+                                      font=ctk.CTkFont(size=12))
+        prompt_text.grid(row=6, column=1, sticky="we", padx=(8, 0), pady=(0, 4))
         if self.config.ai.prompt:
             prompt_text.insert("1.0", self.config.ai.prompt)
-        ttk.Label(ai, text="追加给 AI 的风格要求，例如「用轻松吐槽的语气，保留拟声词」",
-                  foreground="#888").grid(row=7, column=1, sticky="w", padx=(8, 0))
-        ttk.Button(ai, text="测试 AI", width=10,
-                   command=lambda: run_test("ai")).grid(row=8, column=1, sticky="w", pady=(10, 0))
-        ttk.Label(ai, textvariable=ai_result, foreground="#3a7", wraplength=500,
-                  justify="left").grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        ai.columnconfigure(1, weight=1)
+        ctk.CTkLabel(ai_inner, text="追加给 AI 的风格要求，例如「用轻松吐槽的语气，保留拟声词」",
+                     text_color="#94a3b8", fg_color="transparent",
+                     anchor="w").grid(row=7, column=1, sticky="w", padx=(8, 0))
+        ctk.CTkButton(ai_inner, text="测试 AI", width=100,
+                      command=lambda: run_test("ai")).grid(
+            row=8, column=1, sticky="w", pady=(10, 0))
+        ctk.CTkLabel(ai_inner, textvariable=ai_result, text_color="#16a34a",
+                     fg_color="transparent", wraplength=500,
+                     justify="left").grid(row=9, column=0, columnspan=3,
+                                          sticky="w", pady=(8, 0))
 
-        # -- 性能（执行后端 / 线程 / OCR 批处理） --------------------------
-        perf = ttk.LabelFrame(body, text="性能（修改后自动重新加载模型）", padding=10)
-        perf.pack(fill="x", pady=(10, 0))
-        perf.columnconfigure(1, weight=1)
+        # ── 性能 ─────────────────────────────────────────────────────────
+        perf_inner = section(body, "性能（修改后自动重新加载模型）")
+        perf_inner.columnconfigure(1, weight=1)
 
         devices = available_devices()
-        device_var = tk.StringVar(value=DEVICE_LABELS.get(self.engine.device, self.engine.device))
-        ttk.Label(perf, text="执行后端").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(perf, textvariable=device_var,
-                     values=[DEVICE_LABELS.get(name, name) for name in devices],
-                     state="readonly", width=22).grid(row=0, column=1, sticky="w", padx=(8, 0))
-        device_help = ttk.Button(perf, text="?", width=2, cursor="question_arrow")
-        device_help.grid(row=0, column=2, sticky="w", padx=(6, 0))
-        device_help.configure(command=HoverTip(device_help, DEVICE_HELP).show)
+        device_var = tk.StringVar(value=DEVICE_LABELS.get(self.engine.device,
+                                                           self.engine.device))
+        row_label(perf_inner, "执行后端", 0)
+        dev_row = ctk.CTkFrame(perf_inner, fg_color="transparent")
+        dev_row.grid(row=0, column=1, columnspan=2, sticky="w",
+                     padx=(8, 0), pady=(0, 8))
+        ctk.CTkComboBox(dev_row, variable=device_var,
+                        values=[DEVICE_LABELS.get(n, n) for n in devices],
+                        state="readonly", width=220).pack(side="left")
+        dev_help = ctk.CTkButton(dev_row, text="?", width=30, cursor="question_arrow",
+                                  **_BTN_SECONDARY)
+        dev_help.pack(side="left", padx=(8, 0))
+        dev_help.configure(command=HoverTip(dev_help, DEVICE_HELP).show)
 
         threads_var = tk.StringVar(value=str(self.engine.threads))
-        ttk.Label(perf, text="CPU 线程").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(perf, textvariable=threads_var, width=8).grid(
-            row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        row_label(perf_inner, "CPU 线程", 1)
+        ctk.CTkEntry(perf_inner, textvariable=threads_var, width=90).grid(
+            row=1, column=1, sticky="w", padx=(8, 0), pady=(0, 8))
 
         batch_var = tk.StringVar(value=str(self.engine.ocr_batch))
-        ttk.Label(perf, text="OCR 批处理").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Combobox(perf, textvariable=batch_var,
-                     values=[str(n) for n in OCR_BATCH_CHOICES],
-                     state="readonly", width=8).grid(
-            row=2, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        row_label(perf_inner, "OCR 批处理", 2)
+        ctk.CTkComboBox(perf_inner, variable=batch_var,
+                        values=[str(n) for n in OCR_BATCH_CHOICES],
+                        state="readonly", width=90).grid(
+            row=2, column=1, sticky="w", padx=(8, 0), pady=(0, 8))
 
-        ttk.Label(perf, text=PERF_HELP, foreground="#888", wraplength=520,
-                  justify="left").grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ctk.CTkLabel(perf_inner, text=PERF_HELP, text_color="#94a3b8",
+                     fg_color="transparent", wraplength=520,
+                     justify="left", anchor="w").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(0, 4))
 
+        # ── profile helpers ───────────────────────────────────────────────
         def temperature() -> float:
             try:
                 return float(temp_var.get())
@@ -1054,9 +1237,10 @@ class MangaExtractApp:
                 return 0.3
 
         def refresh_profile_box(select: int) -> None:
-            names = [p.name or f"配置 {i + 1}" for i, p in enumerate(self.config.ai_profiles)]
+            names = [p.name or f"配置 {i + 1}"
+                     for i, p in enumerate(self.config.ai_profiles)]
             profile_box.configure(values=names)
-            profile_box.current(select)
+            profile_box.set(names[select])
 
         def load_profile(index: int) -> None:
             profile = self.config.ai_profiles[index]
@@ -1074,7 +1258,6 @@ class MangaExtractApp:
             refresh_profile_box(index)
 
         def store_profile() -> None:
-            """Write the form back into the selected profile."""
             index = state["index"]
             profile = self.config.ai_profiles[index]
             profile.name = name_var.get().strip() or f"配置 {index + 1}"
@@ -1087,13 +1270,19 @@ class MangaExtractApp:
             self.config.ai = profile
 
         def on_profile_selected(_event: object = None) -> None:
-            target = profile_box.current()
-            if target < 0 or target == state["index"]:
+            target_name = profile_box.get()
+            names = [p.name or f"配置 {i + 1}"
+                     for i, p in enumerate(self.config.ai_profiles)]
+            try:
+                target = names.index(target_name)
+            except ValueError:
+                return
+            if target == state["index"]:
                 return
             store_profile()
             load_profile(target)
 
-        profile_box.bind("<<ComboboxSelected>>", on_profile_selected)
+        profile_box.configure(command=on_profile_selected)
 
         def add_profile() -> None:
             store_profile()
@@ -1114,11 +1303,12 @@ class MangaExtractApp:
             del self.config.ai_profiles[index]
             load_profile(min(index, len(self.config.ai_profiles) - 1))
 
-        load_profile(next((i for i, p in enumerate(self.config.ai_profiles)
-                           if p is self.config.ai), 0))
+        load_profile(next(
+            (i for i, p in enumerate(self.config.ai_profiles) if p is self.config.ai), 0
+        ))
 
-        # -- 两个通道各自独立的「测试」 ------------------------------------
-        test_vars = {"web": web_result, "ai": ai_result}
+        # ── test buttons ─────────────────────────────────────────────────
+        test_vars: Dict[str, tk.StringVar] = {"web": web_result, "ai": ai_result}
         results: Dict[str, str] = {}
         active: set = set()
         polling = {"running": False}
@@ -1155,7 +1345,7 @@ class MangaExtractApp:
                 try:
                     out = cfg.build_translator().translate([TEST_SENTENCE])
                     results[channel] = "✓ " + (out[0] if out else "(空)")
-                except Exception as exc:  # noqa: BLE001 - surfaced to the user
+                except Exception as exc:  # noqa: BLE001
                     results[channel] = f"✗ {exc}"
 
             threading.Thread(target=work, daemon=True).start()
@@ -1163,37 +1353,41 @@ class MangaExtractApp:
                 polling["running"] = True
                 dlg.after(150, poll_tests)
 
+        # ── save / cancel ────────────────────────────────────────────────
         def save_and_close() -> None:
             store_profile()
             self.config.mode = self._mode.get()
             self.config.web_engine = self._engine_code(engine_var.get())
             self.config.target_lang = self._lang_code(lang_var.get())
-            self._mode.set(self.config.mode)
             self._save_config()
             self._refresh_mode_labels()
 
-            engine = EngineConfig(
+            new_engine = EngineConfig(
                 device=self._device_code(device_var.get()),
                 threads=_parse_threads(threads_var.get()),
                 ocr_batch=_parse_batch(batch_var.get()),
             ).normalized()
-            changed = engine != self.engine
-            self.engine = engine
+            changed = (
+                new_engine.device != self.engine.device
+                or new_engine.threads != self.engine.threads
+                or new_engine.ocr_batch != self.engine.ocr_batch
+            )
+            self.engine = new_engine
             try:
-                engine.save(ENGINE_CONFIG_PATH)
+                self.engine.save(ENGINE_CONFIG_PATH)
             except OSError as exc:
-                self._set_status(f"性能设置保存失败：{exc}")
-            if changed:
-                # device/threads/batch only take effect on a fresh session.
-                self.reload_models()
-            else:
-                self._set_status("翻译设置已保存")
+                self._set_status(f"性能配置保存失败：{exc}")
             dlg.destroy()
+            if changed:
+                self.reload_models()
 
-        ttk.Button(actions, text="保存", width=8, command=save_and_close).pack(side="right")
-        ttk.Button(actions, text="取消", width=8, command=dlg.destroy).pack(side="right", padx=(0, 6))
+        ctk.CTkButton(actions, text="保存并关闭", width=110,
+                      command=save_and_close).pack(side="right")
+        ctk.CTkButton(actions, text="取消", width=90,
+                      command=dlg.destroy, **_BTN_SECONDARY).pack(side="right", padx=(0, 8))
 
-    # -- toolbar actions -----------------------------------------------------
+    # -- action handlers (clipboard, copy, save, export, clear) --------------
+
     def on_copy_all(self) -> None:
         texts = [self._card_display(c) for c in self._cards if self._card_display(c)]
         if not texts:
@@ -1210,7 +1404,6 @@ class MangaExtractApp:
         self._set_status(f"已复制 {len(text)} 字")
 
     def on_export_overlays(self) -> None:
-        """Export the translated-image overlay of every translated card at once."""
         if self._exporting_overlays:
             self._set_status("正在导出叠图，请稍候…")
             return
@@ -1227,7 +1420,6 @@ class MangaExtractApp:
                          daemon=True).start()
 
     def _export_overlays(self, cards: List[Dict], out_dir: str) -> None:
-        """Render and write one overlay per card (runs off the UI thread)."""
         directory = Path(out_dir)
         saved = 0
         failures: List[str] = []
@@ -1247,7 +1439,7 @@ class MangaExtractApp:
                 saved += 1
             except TypesetError as exc:
                 failures.append(f"第 {number} 张：{exc}")
-            except Exception as exc:  # noqa: BLE001 - surfaced to the user
+            except Exception as exc:  # noqa: BLE001
                 failures.append(f"第 {number} 张：{type(exc).__name__}: {exc}")
         self.queue.put(("overlays_done", (saved, len(cards), str(directory), failures)))
 
@@ -1296,41 +1488,42 @@ class MangaExtractApp:
         self._set_status("已清空")
 
     # -- helpers -------------------------------------------------------------
+
     def _toggle_topmost(self) -> None:
         self.root.attributes("-topmost", self._topmost.get())
 
     def _set_status(self, message: str) -> None:
         self.status.configure(text=message)
 
-    def _on_canvas_configure(self, event: tk.Event) -> None:
-        self.canvas.itemconfigure(self._log_window, width=event.width)
-        wrap = max(140, event.width - THUMB_SIZE - 50)
+    def _on_log_configure(self, event: tk.Event) -> None:
+        """Update text-label wraplengths when the log frame is resized."""
+        wrap = max(140, event.width - THUMB_SIZE - 60)
         for label in self._text_labels:
             if label.winfo_exists():
                 label.configure(wraplength=wrap)
 
-    def _on_mousewheel(self, event: tk.Event) -> None:
-        self.canvas.yview_scroll(int(-event.delta / 120), "units")
-
     def _scroll_to_bottom(self) -> None:
-        self.canvas.update_idletasks()
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        self.canvas.yview_moveto(1.0)
+        self.log.update_idletasks()
+        try:
+            self.log._parent_canvas.yview_moveto(1.0)  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
 
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
 
 def _pil_to_bgr(image: Image.Image) -> np.ndarray:
-    """PIL image -> OpenCV BGR array."""
     return cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
 
 
 def _editor_height(text: str, per_row: int = 28) -> int:
-    """Line count for a Text widget roughly sized to its content."""
-    rows = -(-len(text) // per_row)  # ceil division
+    rows = -(-len(text) // per_row)
     return max(1, min(5, rows))
 
 
 def _rewrite_block_text(block, text: str) -> None:
-    """Replace a block's OCR text with one line covering the whole block box."""
     x1, y1, x2, y2 = (float(value) for value in block.xyxy)
     block.lines = [ExtractedLine(
         polygon=[[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
@@ -1359,6 +1552,10 @@ def _format_detail(result: Optional[PageResult],
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# CLI / entry point
+# ---------------------------------------------------------------------------
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manga-extract-gui",
@@ -1372,16 +1569,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: Optional[List[str]] = None,
+         root: Optional[tk.Tk] = None) -> int:
+    """Entry point for the GUI.
+
+    ``root`` may be a pre-created Tk instance (e.g. from a splash screen in
+    ``run_gui.py``). When omitted a fresh :class:`ctk.CTk` is created here.
+    """
     args = build_parser().parse_args(argv)
 
     enable_dpi_awareness()
-    root = tk.Tk()
-    try:
-        ttk.Style().theme_use("vista")
-    except tk.TclError:
-        pass
-    app = MangaExtractApp(
+    if root is None:
+        root = ctk.CTk()
+    app = MangaExtractApp(  # noqa: F841
         root,
         model_path=args.model,
         hf_endpoint=args.hf_endpoint,

@@ -72,16 +72,23 @@ class MangaOcrRecognizer:
 
     __call__ = recognize
 
-    def recognize_many(self, images: Sequence[np.ndarray]) -> List[str]:
+    def recognize_many(self, images: Sequence[np.ndarray],
+                       on_progress=None) -> List[str]:
         """Recognize several crops, preserving order.
 
         With ``batch_size == 1`` this is a plain loop; larger values run the
         underlying model on ``batch_size`` crops per forward pass.
+
+        ``on_progress``, if given, is called as ``on_progress(done, total)``
+        after each batch so callers can update a progress indicator.
         """
         results = [""] * len(images)
+        total = len(images)
         if self.batch_size <= 1:
             for index, image in enumerate(images):
                 results[index] = self.recognize(image)
+                if on_progress:
+                    on_progress(index + 1, total)
             return results
 
         pending = [
@@ -89,10 +96,14 @@ class MangaOcrRecognizer:
             for index, image in enumerate(images)
             if image is not None and image.size
         ]
+        done = 0
         for start in range(0, len(pending), self.batch_size):
             chunk = pending[start:start + self.batch_size]
             for (index, _), text in zip(chunk, self._decode([pil for _, pil in chunk])):
                 results[index] = text
+            done += len(chunk)
+            if on_progress:
+                on_progress(done, total)
         return results
 
     def _decode(self, images: List[Image.Image]) -> List[str]:

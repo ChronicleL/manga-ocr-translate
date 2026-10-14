@@ -95,11 +95,18 @@ def crop_polygon_region(
     return image[top:bottom, left:right]
 
 
-def _recognize_all(recognizer: Any, crops: Sequence[np.ndarray]) -> List[str]:
+def _recognize_all(recognizer: Any, crops: Sequence[np.ndarray],
+                   on_progress=None) -> List[str]:
     """Recognize crops in one go when the recognizer supports batching."""
     if hasattr(recognizer, "recognize_many"):
-        return list(map(str, recognizer.recognize_many(crops)))
-    return [recognizer.recognize(crop) for crop in crops]
+        return list(map(str, recognizer.recognize_many(crops, on_progress=on_progress)))
+    results = []
+    total = len(crops)
+    for i, crop in enumerate(crops):
+        results.append(str(recognizer.recognize(crop)))
+        if on_progress:
+            on_progress(i + 1, total)
+    return results
 
 
 class MangaExtractor:
@@ -141,8 +148,18 @@ class MangaExtractor:
         )
         return detection, blocks
 
-    def extract_page(self, image: np.ndarray, source: str = "") -> PageResult:
-        """Run the full pipeline (detection + ordering + OCR) on an image."""
+    def extract_page(self, image: np.ndarray, source: str = "",
+                     on_progress=None) -> PageResult:
+        """Run the full pipeline (detection + ordering + OCR) on an image.
+
+        ``on_progress``, if given, is called with ``(stage, done, total)``
+        where *stage* is ``"detect"`` (once, after detection) or ``"ocr"``
+        (repeatedly, after each recognition batch):
+
+        * ``("detect", n_blocks, n_lines)`` – detection finished; n_blocks text
+          blocks and n_lines text lines were found.
+        * ``("ocr", done, total)``           – *done* of *total* lines recognised.
+        """
         detection, blocks = self.extract_blocks(image)
 
         recognizer = self._recognizer
@@ -169,10 +186,16 @@ class MangaExtractor:
                         crops.append(crop)
             result_blocks.append(extracted)
 
+        if on_progress:
+            on_progress("detect", len(blocks), len(crops))
+
         # Every crop goes through the recognizer at once so a batching
         # recognizer can fill a single forward pass instead of one per line.
         if recognizer is not None and crops:
-            for (block_index, line_index), text in zip(slots, _recognize_all(recognizer, crops)):
+            ocr_cb = (lambda d, t: on_progress("ocr", d, t)) if on_progress else None
+            for (block_index, line_index), text in zip(
+                slots, _recognize_all(recognizer, crops, on_progress=ocr_cb)
+            ):
                 result_blocks[block_index].lines[line_index].text = text
 
         return PageResult(
