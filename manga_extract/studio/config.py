@@ -43,6 +43,8 @@ class StudioConfig:
     show_boxes: bool = True                   # outline text blocks on the canvas
     last_url: str = ""                        # last chapter URL typed in the web-import dialog
     last_export_folder: str = ""              # where the last chapter export went
+    font_path: str = ""                       # typeset font file; empty = first CJK font found
+    font_scale: float = 1.0                   # scales the upper bound of the automatic font size
 
     def remember_project(self, folder: str | Path) -> None:
         folder = str(Path(folder))
@@ -74,9 +76,12 @@ class StudioConfig:
         for name in ("auto_recognize", "show_boxes"):
             if isinstance(data.get(name), bool):
                 setattr(config, name, data[name])
-        for name in ("last_url", "last_export_folder"):
+        for name in ("last_url", "last_export_folder", "font_path"):
             if isinstance(data.get(name), str):
                 setattr(config, name, data[name])
+        scale = data.get("font_scale")
+        if isinstance(scale, (int, float)) and not isinstance(scale, bool) and 0.3 <= scale <= 3.0:
+            config.font_scale = float(scale)
         return config
 
     def save(self, path: str | Path = STUDIO_CONFIG_PATH) -> None:

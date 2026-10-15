@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
@@ -28,13 +28,29 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from qfluentwidgets import BodyLabel
+from qfluentwidgets import Action, BodyLabel, FluentIcon as FIF, RoundMenu
 
 from .floating_bar import FloatingBar
 
 MIN_SCALE = 0.05
 MAX_SCALE = 8.0
 ZOOM_STEP = 1.15
+_HANDLE_SIZE = 7          # screen pixels; constant because handles ignore transforms
+_MIN_BOX_PX  = 8          # minimum image-pixel dimension enforced during drag
+_DEFAULT_BOX = 80         # size (in image pixels) of a newly-added block
+
+# Eight handle positions and their drag semantics.
+# (anchor_x, anchor_y, moves_left, moves_top, moves_right, moves_bottom, cursor)
+_HANDLES: Tuple = (
+    (0.0, 0.0, True,  True,  False, False, Qt.CursorShape.SizeFDiagCursor),
+    (0.5, 0.0, False, True,  False, False, Qt.CursorShape.SizeVerCursor),
+    (1.0, 0.0, False, True,  True,  False, Qt.CursorShape.SizeBDiagCursor),
+    (0.0, 0.5, True,  False, False, False, Qt.CursorShape.SizeHorCursor),
+    (1.0, 0.5, False, False, True,  False, Qt.CursorShape.SizeHorCursor),
+    (0.0, 1.0, True,  False, False, True,  Qt.CursorShape.SizeBDiagCursor),
+    (0.5, 1.0, False, False, False, True,  Qt.CursorShape.SizeVerCursor),
+    (1.0, 1.0, False, False, True,  True,  Qt.CursorShape.SizeFDiagCursor),
+)
 
 
 class _Badge(QGraphicsItem):
@@ -68,6 +84,27 @@ class _Badge(QGraphicsItem):
         painter.drawText(self.boundingRect(), Qt.AlignmentFlag.AlignCenter, self._text)
 
 
+class _Handle(QGraphicsRectItem):
+    """One resize handle child of a BlockItem; ignores view transformation."""
+
+    def __init__(self, handle_idx: int, parent: "BlockItem") -> None:
+        sz = _HANDLE_SIZE
+        super().__init__(-sz / 2, -sz / 2, sz, sz, parent)
+        ax, ay, self.cl, self.ct, self.cr, self.cb, cursor = _HANDLES[handle_idx]
+        self.anchor_x = ax
+        self.anchor_y = ay
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        self.setZValue(101)
+        self.setPen(QPen(QColor("#0078d4"), 1.5))
+        self.setBrush(QBrush(QColor("#ffffff")))
+        self.setCursor(cursor)
+        self.setVisible(False)
+
+    def reposition(self, rect: QRectF) -> None:
+        self.setPos(rect.x() + self.anchor_x * rect.width(),
+                    rect.y() + self.anchor_y * rect.height())
+
+
 class BlockItem(QGraphicsRectItem):
     """Outline of one text block, in image-pixel coordinates."""
 
@@ -78,17 +115,24 @@ class BlockItem(QGraphicsRectItem):
         self.badge = _Badge(str(index + 1), self)
         self.badge.setPos(rect.topLeft())
         self._selected = False
+        self._handles = [_Handle(i, self) for i in range(8)]
         self.set_color(QColor("#0078d4"))
 
     def set_color(self, color: QColor) -> None:
         self._color = color
         self.badge.set_color(color)
+        for h in self._handles:
+            h.setPen(QPen(color, 1.5))
         self._restyle()
 
     def set_selected(self, selected: bool) -> None:
         self._selected = selected
         self._restyle()
         self.setZValue(50 if selected else 1 + self.index * 1e-3)
+        for h in self._handles:
+            h.setVisible(selected)
+        if selected:
+            self._reposition_handles()
 
     def _restyle(self) -> None:
         pen = QPen(self._color, 3 if self._selected else 2)
@@ -98,12 +142,29 @@ class BlockItem(QGraphicsRectItem):
         fill.setAlpha(70 if self._selected else 22)
         self.setBrush(QBrush(fill))
 
+    def update_rect(self, rect: QRectF) -> None:
+        """Change the displayed rect and reposition badge + handles."""
+        self.setRect(rect)
+        self.badge.setPos(rect.topLeft())
+        if self._selected:
+            self._reposition_handles()
+
+    def _reposition_handles(self) -> None:
+        r = self.rect()
+        for h in self._handles:
+            h.reposition(r)
+
 
 class CanvasView(QGraphicsView):
     """Zoom with Ctrl+wheel, pan by dragging, double-click to fit, click to select a block."""
 
-    blockClicked = Signal(int)     # block index, -1 when the click hit no block
-    zoomChanged = Signal(float)    # 1.0 == one image pixel per logical pixel
+    blockClicked = Signal(int)          # block index, -1 when the click hit no block
+    zoomChanged = Signal(float)         # 1.0 == one image pixel per logical pixel
+    # Box-editing signals
+    blockGeometryChanged = Signal(int, int, int, int, int)  # index, x1, y1, x2, y2
+    blockAddRequested    = Signal(int, int, int, int)        # x1, y1, x2, y2 (image coords)
+    blockDeleteRequested = Signal(int)                       # block index
+    blockRedetectRequested = Signal(int)                     # block index
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -122,6 +183,13 @@ class CanvasView(QGraphicsView):
         self._accent = QColor("#0078d4")
         self._fit_mode = True
         self._press_pos: Optional[QPointF] = None
+        self._page_rect = QRectF()
+
+        # Handle/block drag state
+        self._drag_block  = -1           # index of block being dragged (-1 = none)
+        self._drag_handle = -1           # handle index; -1 = move whole block
+        self._drag_scene_start = QPointF()
+        self._drag_rect_start  = QRectF()
 
         self.setRenderHints(QPainter.RenderHint.Antialiasing
                             | QPainter.RenderHint.SmoothPixmapTransform)
@@ -129,13 +197,13 @@ class CanvasView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
         self.setFrameShape(QGraphicsView.Shape.NoFrame)
-        self.setBackgroundBrush(Qt.BrushStyle.NoBrush)   # the pane behind shows through
+        self.setBackgroundBrush(Qt.BrushStyle.NoBrush)
         self.viewport().setAutoFillBackground(False)
         self.setObjectName("canvasView")
         self.setStyleSheet("#canvasView { background: transparent; }")
-        # Panning is by dragging / wheel; the native scroll bars would clash with the look.
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.DefaultContextMenu)
 
     # -- content ------------------------------------------------------------
     def set_page(self, pixmap: QPixmap, blocks: Sequence) -> None:
@@ -143,6 +211,7 @@ class CanvasView(QGraphicsView):
         self._original = pixmap
         self._overlay = QPixmap()
         self._showing_overlay = False
+        self._page_rect = QRectF(pixmap.rect()) if not pixmap.isNull() else QRectF()
         self._item.setPixmap(pixmap)
         self._scene.setSceneRect(QRectF(pixmap.rect()))
         self.set_blocks(blocks)
@@ -207,11 +276,7 @@ class CanvasView(QGraphicsView):
                 self.centerOn(item)
 
     def reveal_block(self, index: int) -> None:
-        """Bring a block into view, moving the canvas only if it is not fully visible.
-
-        Centring on every selection would make the page jump around while the user
-        steps through cards or types in one.
-        """
+        """Bring a block into view, moving the canvas only if it is not fully visible."""
         if not 0 <= index < len(self._blocks):
             return
         item = self._blocks[index]
@@ -236,7 +301,6 @@ class CanvasView(QGraphicsView):
             return
         self._fit_mode = True
         self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
-        # fitInView ignores our limits: very small pages would be blown up.
         current = self.scale_factor()
         if current > 1.0:
             self.resetTransform()
@@ -256,6 +320,59 @@ class CanvasView(QGraphicsView):
         else:
             self.scale(factor, factor)
         self.zoomChanged.emit(self.scale_factor())
+
+    # -- drag helpers --------------------------------------------------------
+    def _item_at_viewport(self, vp_pos):
+        """Walk up from itemAt() result to the first BlockItem or _Handle."""
+        item = self.itemAt(vp_pos.toPoint())
+        while item is not None and not isinstance(item, (BlockItem, _Handle)):
+            item = item.parentItem()
+        return item
+
+    def _start_drag(self, block_item: BlockItem, handle_idx: int,
+                    scene_pos: QPointF) -> None:
+        self._drag_block  = block_item.index
+        self._drag_handle = handle_idx
+        self._drag_scene_start = scene_pos
+        self._drag_rect_start  = QRectF(block_item.rect())
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+
+    def _apply_drag(self, scene_pos: QPointF) -> None:
+        if not 0 <= self._drag_block < len(self._blocks):
+            return
+        dx = scene_pos.x() - self._drag_scene_start.x()
+        dy = scene_pos.y() - self._drag_scene_start.y()
+        r  = QRectF(self._drag_rect_start)
+        if self._drag_handle == -1:
+            # Move entire block
+            r.translate(dx, dy)
+        else:
+            _ax, _ay, cl, ct, cr, cb, _cursor = _HANDLES[self._drag_handle]
+            if cl: r.setLeft(r.left()   + dx)
+            if ct: r.setTop(r.top()     + dy)
+            if cr: r.setRight(r.right() + dx)
+            if cb: r.setBottom(r.bottom() + dy)
+        # Enforce minimum size
+        if r.width()  < _MIN_BOX_PX: r.setWidth(_MIN_BOX_PX)
+        if r.height() < _MIN_BOX_PX: r.setHeight(_MIN_BOX_PX)
+        # Clamp to page bounds
+        if not self._page_rect.isEmpty():
+            r = r.intersected(self._page_rect)
+            if r.width()  < _MIN_BOX_PX: r.setWidth(_MIN_BOX_PX)
+            if r.height() < _MIN_BOX_PX: r.setHeight(_MIN_BOX_PX)
+        self._blocks[self._drag_block].update_rect(r)
+
+    def _finish_drag(self) -> None:
+        if 0 <= self._drag_block < len(self._blocks):
+            r  = self._blocks[self._drag_block].rect()
+            r0 = self._drag_rect_start
+            x1, y1, x2, y2 = (int(round(v)) for v in (r.left(), r.top(), r.right(), r.bottom()))
+            if (x1, y1, x2, y2) != (int(round(r0.left())), int(round(r0.top())),
+                                     int(round(r0.right())), int(round(r0.bottom()))):
+                self.blockGeometryChanged.emit(self._drag_block, x1, y1, x2, y2)
+        self._drag_block  = -1
+        self._drag_handle = -1
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
 
     # -- events -------------------------------------------------------------
     def wheelEvent(self, event) -> None:
@@ -277,21 +394,69 @@ class CanvasView(QGraphicsView):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
+            hit = self._item_at_viewport(event.position())
+            if isinstance(hit, _Handle):
+                block_item = hit.parentItem()
+                if isinstance(block_item, BlockItem) and block_item._selected:
+                    self._start_drag(block_item, block_item._handles.index(hit),
+                                     self.mapToScene(event.position().toPoint()))
+                    event.accept()
+                    return
+            elif isinstance(hit, BlockItem) and hit._selected:
+                # Drag the interior → move the entire block
+                self._start_drag(hit, -1, self.mapToScene(event.position().toPoint()))
+                event.accept()
+                return
             self._press_pos = event.position()
         super().mousePressEvent(event)
 
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_block >= 0:
+            self._apply_drag(self.mapToScene(event.position().toPoint()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
     def mouseReleaseEvent(self, event) -> None:
+        if self._drag_block >= 0 and event.button() == Qt.MouseButton.LeftButton:
+            self._finish_drag()
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
         if event.button() != Qt.MouseButton.LeftButton or self._press_pos is None:
             return
         moved = (event.position() - self._press_pos).manhattanLength()
         self._press_pos = None
         if moved > QApplication.startDragDistance():
-            return                          # it was a pan, not a click
+            return
         item = self.itemAt(event.position().toPoint())
         while item is not None and not isinstance(item, BlockItem):
             item = item.parentItem()
         self.blockClicked.emit(item.index if isinstance(item, BlockItem) else -1)
+
+    def contextMenuEvent(self, event) -> None:
+        hit = self._item_at_viewport(QPointF(event.pos()))
+        while isinstance(hit, _Handle):
+            hit = hit.parentItem()
+        menu = RoundMenu(parent=self)
+        if isinstance(hit, BlockItem):
+            redetect = Action(FIF.SYNC, "重新检测此框")
+            redetect.triggered.connect(lambda: self.blockRedetectRequested.emit(hit.index))
+            menu.addAction(redetect)
+            menu.addSeparator()
+            delete = Action(FIF.DELETE, "删除此框")
+            delete.triggered.connect(lambda: self.blockDeleteRequested.emit(hit.index))
+            menu.addAction(delete)
+        else:
+            sc = self.mapToScene(event.pos())
+            x, y = sc.x(), sc.y()
+            half = _DEFAULT_BOX / 2
+            x1, y1 = int(x - half), int(y - half)
+            x2, y2 = int(x + half), int(y + half)
+            add = Action(FIF.ADD, "在此新增文字框")
+            add.triggered.connect(lambda: self.blockAddRequested.emit(x1, y1, x2, y2))
+            menu.addAction(add)
+        menu.exec(event.globalPos())
 
 
 class CanvasPane(QWidget):

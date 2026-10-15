@@ -168,7 +168,10 @@ class MainWindow(QMainWindow):
         self._export_dialog_factory = export_dialog_factory or (
             lambda parent, project, folder: ExportDialog(parent, project, folder))
         self._settings_factory = settings_factory or (
-            lambda parent, tconfig, econfig, devices: SettingsDialog(parent, tconfig, econfig, devices))
+            lambda parent, tconfig, econfig, devices: SettingsDialog(
+                parent, tconfig, econfig, devices,
+                style=(self.config.font_path, self.config.font_scale)))
+        self._push_typeset_style()
         # Screenshot controller / web dialog are created on demand (tests pass fakes).
         self._capture_factory = capture_factory or (lambda window, accent: ScreenCapture(window, accent))
         self._web_dialog_factory = web_dialog_factory or (
@@ -189,6 +192,8 @@ class MainWindow(QMainWindow):
 
         # Translation batch in progress: job id -> (page id, force overwrite).
         self._translate_jobs: Dict[int, Tuple[str, bool]] = {}
+        # Region re-detection jobs: req_id -> (page_id, block_index, bbox_tuple)
+        self._region_jobs: Dict[str, Tuple[str, int, tuple]] = {}
         self._translate_total = 0
         self._translate_done = 0
         self._translate_applied = 0
@@ -383,6 +388,10 @@ class MainWindow(QMainWindow):
         centre_layout.setContentsMargins(1, 1, 1, 1)
         self.canvas = CanvasPane(centre)
         self.canvas.view.blockClicked.connect(self._on_block_clicked)
+        self.canvas.view.blockGeometryChanged.connect(self._on_block_geometry_changed)
+        self.canvas.view.blockAddRequested.connect(self._on_block_add_requested)
+        self.canvas.view.blockDeleteRequested.connect(self._on_block_delete_requested)
+        self.canvas.view.blockRedetectRequested.connect(self._on_block_redetect_requested)
         self.canvas.overlayToggled.connect(self._on_overlay_toggled)
         self.canvas.bar.boxes_button.setChecked(self.config.show_boxes)
         self.canvas.boxesToggled.connect(self._on_boxes_toggled)
@@ -405,6 +414,7 @@ class MainWindow(QMainWindow):
         self.blocks_panel.sourceEdited.connect(self._on_source_edited)
         self.blocks_panel.translationEdited.connect(self._on_translation_edited)
         self.blocks_panel.reviewedToggled.connect(self._on_reviewed_toggled)
+        self.blocks_panel.fontSizeEdited.connect(self._on_font_size_edited)
         self.blocks_panel.reviewAllRequested.connect(self.review_all_blocks)
         self.blocks_panel.retranslateRequested.connect(self._on_retranslate_block)
         self.blocks_panel.cardSelected.connect(self._on_card_selected)
@@ -435,6 +445,8 @@ class MainWindow(QMainWindow):
         signals.progress.connect(self._on_recognition_progress)
         signals.recognized.connect(self._on_recognized)
         signals.failed.connect(self._on_recognition_failed)
+        signals.regionRecognized.connect(self._on_region_recognized)
+        signals.regionFailed.connect(self._on_region_failed)
         self.overlay.rendered.connect(self._on_overlay_rendered)
         self.overlay.failed.connect(self._on_overlay_failed)
         self.translator.signals.translated.connect(self._on_translated)
@@ -628,6 +640,7 @@ class MainWindow(QMainWindow):
             except OSError as exc:
                 self._warn("翻译设置没能保存", str(exc))
             self._refresh_channels()
+        self._apply_typeset_style(getattr(dialog, "result_style", None))
         new_engine = dialog.result_engine
         if new_engine is not None and new_engine != current:
             try:
@@ -638,6 +651,24 @@ class MainWindow(QMainWindow):
                 self.reload_engine()
                 return
         self.set_status("设置已保存")
+
+    def _push_typeset_style(self) -> None:
+        from ..typeset import set_default_style     # imported late: pulls in cv2 (see bootstrap)
+
+        set_default_style(self.config.font_path, self.config.font_scale)
+
+    def _apply_typeset_style(self, style: Optional[Tuple[str, float]]) -> None:
+        """Take the font / size scale from the settings dialog and redraw the overlays."""
+        if style is None or style == (self.config.font_path, self.config.font_scale):
+            return
+        self.config.font_path, self.config.font_scale = style
+        self._push_typeset_style()
+        for page_id in list(self._versions):
+            self._versions[page_id] += 1
+        self._overlay_cache.clear()
+        current = self.pages.current_id()
+        if current:
+            self.page_data_changed(current, save=False)
 
     def reload_engine(self) -> None:
         """Load the models again with the saved performance settings."""
@@ -1172,6 +1203,97 @@ class MainWindow(QMainWindow):
             self._mark_dirty(page_id)
             self.pages.update_status(page_id, data.status())
             self._overlay_timer.start()                  # re-render once typing pauses
+
+    # -- box editing (canvas signals) ------------------------------------------
+    def _on_block_geometry_changed(self, index: int,
+                                   x1: int, y1: int, x2: int, y2: int) -> None:
+        page_id = self.pages.current_id()
+        data = self._data.get(page_id)
+        if data is None:
+            return
+        if data.set_bbox(index, [x1, y1, x2, y2]):
+            self.page_data_changed(page_id)
+
+    def _on_block_add_requested(self, x1: int, y1: int, x2: int, y2: int) -> None:
+        page_id = self.pages.current_id()
+        data = self._data.get(page_id)
+        if data is None:
+            return
+        idx = data.add_block([x1, y1, x2, y2])
+        self.page_data_changed(page_id)
+        self.canvas.view.select_block(idx)
+        self.blocks_panel.select(idx)
+
+    def _on_block_delete_requested(self, index: int) -> None:
+        page_id = self.pages.current_id()
+        data = self._data.get(page_id)
+        if data is None or not 0 <= index < len(data.blocks):
+            return
+        data.remove_block(index)
+        self.page_data_changed(page_id)
+
+    def _on_block_redetect_requested(self, index: int) -> None:
+        page_id = self.pages.current_id()
+        data = self._data.get(page_id)
+        if data is None or not 0 <= index < len(data.blocks):
+            return
+        block = data.blocks[index]
+        if block.reviewed or block.translation_edited or block.source_edited:
+            dlg = MessageBox("重新检测",
+                             f"#{index + 1} 已有人工改动，重新检测会覆盖原文识别结果。继续？", self)
+            dlg.yesButton.setText("继续")
+            dlg.cancelButton.setText("取消")
+            if not dlg.exec():
+                return
+        if not self._engine_ready:
+            self._warn("识别引擎未就绪", "模型正在加载，请稍候再试。")
+            return
+        import uuid as _uuid
+        req_id = _uuid.uuid4().hex
+        self._region_jobs[req_id] = (page_id, index, tuple(block.bbox))
+        self.engine.submit_region(page_id, str(self.project.image_path(page_id)),
+                                  block.bbox, req_id)
+        self.set_status(f"正在重新检测 #{index + 1}…")
+
+    def _on_region_recognized(self, page_id: str, req_id: str, extracted) -> None:
+        job = self._region_jobs.pop(req_id, None)
+        if job is None:
+            return
+        job_page_id, job_index, job_bbox = job
+        if job_page_id != page_id:
+            return
+        data = self._data.get(page_id)
+        if data is None or not 0 <= job_index < len(data.blocks):
+            return
+        block = data.blocks[job_index]
+        if tuple(block.bbox) != job_bbox:
+            return                          # the user moved the box while we were working
+        if extracted is None or not extracted.text.strip():
+            self._warn("重新检测", f"#{job_index + 1} 未能识别出文字。")
+            return
+        block.bbox     = [int(v) for v in extracted.xyxy]
+        block.vertical = extracted.vertical
+        block.lines    = [{"polygon": ln.polygon, "text": ln.text} for ln in extracted.lines]
+        block.source   = extracted.text.strip()
+        block.source_edited = False         # it came from OCR, not user edits
+        self.page_data_changed(page_id)
+        self.set_status(f"#{job_index + 1} 重新检测完成")
+
+    def _on_region_failed(self, page_id: str, req_id: str, message: str) -> None:
+        self._region_jobs.pop(req_id, None)
+        self._warn("重新检测失败", message)
+
+    def _on_font_size_edited(self, index: int, size: int) -> None:
+        target = self._edit_target(index)
+        if target is None:
+            return
+        page_id, _data, block = target
+        if block.font_size != size:
+            block.font_size = size
+            self._versions[page_id] = self._versions.get(page_id, 0) + 1
+            self._overlay_cache.pop(page_id, None)
+            self._mark_dirty(page_id)
+            self._overlay_timer.start()
 
     def _on_reviewed_toggled(self, index: int, checked: bool) -> None:
         target = self._edit_target(index)

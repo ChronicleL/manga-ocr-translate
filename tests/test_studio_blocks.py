@@ -153,6 +153,17 @@ class BlocksPanelTests(unittest.TestCase):
         self.assertIn("已校对", self.panel.card(0).retranslate_button.toolTip())
 
     # -- refresh must not disturb typing -------------------------------------
+    def test_font_size_choice_is_reported_and_shown(self):
+        self.panel.fontSizeEdited.connect(lambda i, n: self.log.append(("size", i, n)))
+        box = self.panel.card(1).size_box
+        self.assertEqual((box.currentText(), box.currentData()), ("自动", 0))
+        box.setCurrentIndex(box.findText("24"))
+        self.assertIn(("size", 1, 24), self.log)
+        self.blocks[0].font_size = 30                      # a size that is not a preset is kept
+        self.panel.refresh(self.blocks)
+        self.assertEqual(self.panel.card(0).size_box.currentText(), "30")
+        self.assertNotIn(("size", 0, 30), self.log)        # showing it is not an edit
+
     def test_refresh_keeps_a_trailing_space_the_user_is_typing(self):
         edit = self.panel.card(0).source_edit
         edit.setFocus()

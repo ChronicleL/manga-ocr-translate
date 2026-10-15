@@ -9,7 +9,8 @@ from __future__ import annotations
 import copy
 import threading
 from dataclasses import replace
-from typing import Callable, List, Optional
+from pathlib import Path
+from typing import Callable, List, Optional, Tuple
 
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QIntValidator
@@ -51,6 +52,8 @@ from .ui_common import BG_DARK, BG_LIGHT
 # builder(config) -> translator with .translate(list[str]); replaced in tests.
 TranslatorBuilder = Callable[[TranslationConfig], object]
 
+FONT_SCALE_CHOICES = [0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.5, 2.0]
+
 
 def apply_translation_settings(target: TranslationConfig, edited: TranslationConfig) -> None:
     """Copy the edited settings into ``target`` *in place* (the window keeps one object)."""
@@ -77,8 +80,10 @@ class SettingsDialog(QDialog):
 
     def __init__(self, parent: Optional[QWidget], translation_config: TranslationConfig,
                  engine_config: EngineConfig, devices: List[str],
-                 translator_builder: Optional[TranslatorBuilder] = None) -> None:
+                 translator_builder: Optional[TranslatorBuilder] = None,
+                 style: Optional[Tuple[str, float]] = None) -> None:
         super().__init__(parent)
+        self._style = style                                       # (font path, size scale) or None
         self.setWindowTitle("设置")
         self.setModal(True)
         self.resize(660, 780)
@@ -89,6 +94,7 @@ class SettingsDialog(QDialog):
         self.engine = engine_config
         self.result_translation: Optional[TranslationConfig] = None
         self.result_engine: Optional[EngineConfig] = None
+        self.result_style: Optional[Tuple[str, float]] = None
         self._builder = translator_builder or (lambda cfg: cfg.build_translator())
         self._index = 0
         self._loading = False
@@ -102,6 +108,8 @@ class SettingsDialog(QDialog):
         column.setSpacing(12)
         column.addWidget(self._build_web_card())
         column.addWidget(self._build_ai_card())
+        if style is not None:
+            column.addWidget(self._build_typeset_card(*style))
         column.addWidget(self._build_perf_card(devices))
         column.addStretch(1)
 
@@ -230,6 +238,36 @@ class SettingsDialog(QDialog):
         box.addLayout(test_row)
         box.addWidget(self.ai_result)
         self.profile_box.currentIndexChanged.connect(self._on_profile_selected)
+        return frame
+
+    def _build_typeset_card(self, font_path: str, font_scale: float) -> QFrame:
+        from ..typeset import list_system_fonts
+
+        frame, box = self._card("译文排版")
+        self.font_box = ComboBox(frame)
+        self._font_paths = [""]
+        self.font_box.addItem("自动（第一个可用的中文字体）")
+        try:
+            fonts = list_system_fonts()
+        except Exception:  # noqa: BLE001 - a broken font must not stop the dialog opening
+            fonts = []
+        for name, path in fonts:
+            self.font_box.addItem(name)
+            self._font_paths.append(path)
+        if font_path and font_path not in self._font_paths:    # a font that is no longer listed
+            self.font_box.addItem(Path(font_path).name)
+            self._font_paths.append(font_path)
+        self.font_box.setCurrentIndex(self._font_paths.index(font_path)
+                                      if font_path in self._font_paths else 0)
+        self.scale_box = ComboBox(frame)
+        self.scale_box.addItems([f"{round(v * 100)}%" for v in FONT_SCALE_CHOICES])
+        nearest = min(FONT_SCALE_CHOICES, key=lambda v: abs(v - font_scale))
+        self.scale_box.setCurrentIndex(FONT_SCALE_CHOICES.index(nearest))
+        hint = CaptionLabel("字号倍率缩放自动字号的上限；单个文本块的字号可在右侧校对卡片里单独指定。", frame)
+        hint.setWordWrap(True)
+        box.addLayout(self._row("字体", self.font_box))
+        box.addLayout(self._row("字号倍率", self.scale_box, stretch=-1))
+        box.addWidget(hint)
         return frame
 
     def _build_perf_card(self, devices: List[str]) -> QFrame:
@@ -377,6 +415,9 @@ class SettingsDialog(QDialog):
         self.config.web_engine = WEB_ENGINES.get(self.engine_box.currentText(), "google")
         self.config.target_lang = TARGET_LANGUAGES.get(self.lang_box.currentText(), "zh-CN")
         self.result_translation = self.config
+        if self._style is not None:
+            self.result_style = (self._font_paths[self.font_box.currentIndex()],
+                                 FONT_SCALE_CHOICES[self.scale_box.currentIndex()])
         code = self._device_codes[self.device_box.currentIndex()] if self._device_codes else "auto"
         try:
             batch = int(self.batch_box.currentText())

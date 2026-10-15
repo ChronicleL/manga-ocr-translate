@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget
 from qfluentwidgets import (
     CaptionLabel,
     CheckBox,
+    ComboBox,
     FluentIcon as FIF,
     PushButton,
     SmoothScrollArea,
@@ -22,6 +23,7 @@ from qfluentwidgets import (
 from .shortcuts import hint
 
 MAX_EDIT_LINES = 8
+FONT_SIZE_CHOICES = (12, 14, 16, 18, 20, 24, 28, 32, 36, 40, 48, 56, 64)
 
 
 class AutoHeightEdit(TextEdit):
@@ -83,6 +85,7 @@ class BlockCard(QFrame):
     translationEdited = Signal(int, str)
     reviewedToggled = Signal(int, bool)
     retranslateRequested = Signal(int)
+    fontSizeEdited = Signal(int, int)
     selected = Signal(int)
 
     def __init__(self, index: int, block, parent: Optional[QWidget] = None) -> None:
@@ -95,6 +98,12 @@ class BlockCard(QFrame):
         self.direction = CaptionLabel("竖排" if block.vertical else "横排", self)
         self.review_box = CheckBox("已校对", self)
         self.review_box.toggled.connect(lambda checked: self.reviewedToggled.emit(self.index, checked))
+        self.size_box = ComboBox(self)
+        self.size_box.setFixedWidth(88)
+        self.size_box.setToolTip("译文字号（像素），「自动」按文本框大小适配")
+        self._fill_sizes(getattr(block, "font_size", 0))
+        self.size_box.currentIndexChanged.connect(
+            lambda i: self.fontSizeEdited.emit(self.index, self.size_box.itemData(i) or 0))
         self.retranslate_button = TransparentToolButton(FIF.SYNC, self)
         self.retranslate_button.clicked.connect(lambda: self.retranslateRequested.emit(self.index))
         self.retranslate_button.installEventFilter(ToolTipFilter(self.retranslate_button))
@@ -121,10 +130,26 @@ class BlockCard(QFrame):
         layout.addWidget(CaptionLabel("原文", self))
         layout.addWidget(self.source_edit)
         layout.addSpacing(4)
-        layout.addWidget(CaptionLabel("译文", self))
+        target_row = QHBoxLayout()
+        target_row.addWidget(CaptionLabel("译文", self))
+        target_row.addStretch(1)
+        target_row.addWidget(CaptionLabel("字号", self))
+        target_row.addWidget(self.size_box)
+        layout.addLayout(target_row)
         layout.addWidget(self.target_edit)
 
         self.sync_from(block)
+
+    def _fill_sizes(self, current: int) -> None:
+        """Fill the size drop-down (item data = pixels, 0 = automatic) and select ``current``."""
+        sizes = sorted({*FONT_SIZE_CHOICES, current} - {0})
+        self.size_box.blockSignals(True)
+        self.size_box.clear()
+        self.size_box.addItem("自动", userData=0)
+        for size in sizes:
+            self.size_box.addItem(str(size), userData=size)
+        self.size_box.setCurrentIndex(0 if current == 0 else sizes.index(current) + 1)
+        self.size_box.blockSignals(False)
 
     def sync_from(self, block) -> None:
         """Show the block's current state without reporting it back as an edit."""
@@ -137,6 +162,9 @@ class BlockCard(QFrame):
         self.review_box.blockSignals(True)
         self.review_box.setChecked(block.reviewed)
         self.review_box.blockSignals(False)
+        current = getattr(block, "font_size", 0)
+        if (self.size_box.currentData() or 0) != current:
+            self._fill_sizes(current)
         can_retranslate = block.has_text and not block.reviewed
         self.retranslate_button.setEnabled(can_retranslate)
         self.retranslate_button.setToolTip("重新翻译此块" if can_retranslate
@@ -165,6 +193,7 @@ class BlocksPanel(QWidget):
     reviewedToggled = Signal(int, bool)
     reviewAllRequested = Signal()
     retranslateRequested = Signal(int)
+    fontSizeEdited = Signal(int, int)   # block index, size in pixels (0 = automatic)
     cardSelected = Signal(int)          # user clicked / focused a card
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -249,6 +278,7 @@ class BlocksPanel(QWidget):
             card.sourceEdited.connect(self.sourceEdited)
             card.translationEdited.connect(self.translationEdited)
             card.reviewedToggled.connect(self._on_reviewed)
+            card.fontSizeEdited.connect(self.fontSizeEdited)
             card.retranslateRequested.connect(self.retranslateRequested)
             card.selected.connect(self._on_card_selected)
             card.restyle(self._dark, self._accent)

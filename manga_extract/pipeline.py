@@ -205,6 +205,73 @@ class MangaExtractor:
             blocks=result_blocks,
         )
 
+    def redetect_region(self, image: np.ndarray, xyxy: Sequence[int]) -> "ExtractedBlock":
+        """Re-detect and OCR within a user-supplied rectangle.
+
+        Detection runs on the cropped sub-image with looser thresholds (the letterbox
+        zoom improves recall on small text). If nothing is detected, the whole rectangle
+        is treated as a single text line.  Always returns an ``ExtractedBlock`` (text may
+        be empty if no recognizer is loaded or the crop is blank).
+        """
+        x1, y1, x2, y2 = (int(v) for v in xyxy)
+        h, w = image.shape[:2]
+        x1 = max(0, x1); y1 = max(0, y1)
+        x2 = min(w, x2); y2 = min(h, y2)
+        crop = image[y1:y2, x1:x2]
+        if crop.size == 0:
+            return ExtractedBlock(xyxy=[x1, y1, x2, y2], language="unknown", vertical=False)
+
+        # Detect on the crop with looser thresholds for better recall.
+        old_conf = self.detector.conf_thresh
+        old_box  = self.detector.box_score_thresh
+        self.detector.conf_thresh      = 0.2
+        self.detector.box_score_thresh = 0.4
+        try:
+            detection = self.detector.detect(crop)
+        finally:
+            self.detector.conf_thresh      = old_conf
+            self.detector.box_score_thresh = old_box
+
+        ch, cw = crop.shape[:2]
+        sub_blocks = group_text_lines(
+            detection.blocks, detection.lines, detection.line_scores,
+            detection.mask, cw, ch,
+        )
+
+        if sub_blocks:
+            primary = sub_blocks[0]
+            result_xyxy = [
+                int(primary.xyxy[0]) + x1, int(primary.xyxy[1]) + y1,
+                int(primary.xyxy[2]) + x1, int(primary.xyxy[3]) + y1,
+            ]
+            vertical = primary.vertical
+            line_polys: List[List[List[float]]] = []
+            for blk in sub_blocks:
+                for poly in blk.lines:
+                    line_polys.append([[float(p[0]) + x1, float(p[1]) + y1] for p in poly])
+        else:
+            # Fallback: treat the entire rectangle as one line.
+            result_xyxy = [x1, y1, x2, y2]
+            vertical = False
+            line_polys = [[[float(x1), float(y1)], [float(x2), float(y1)],
+                           [float(x2), float(y2)], [float(x1), float(y2)]]]
+
+        extracted = ExtractedBlock(xyxy=result_xyxy, language="ja", vertical=vertical)
+
+        recognizer = self._recognizer
+        if recognizer is not None and line_polys:
+            crops = [crop_polygon_region(image, poly) for poly in line_polys]
+            crops = [c for c in crops if c is not None]
+            if crops:
+                texts = _recognize_all(recognizer, crops)
+                for poly, text in zip(line_polys, texts):
+                    extracted.lines.append(ExtractedLine(
+                        polygon=poly,
+                        text=text,
+                    ))
+
+        return extracted
+
     def extract_file(self, path: str | Path) -> PageResult:
         path = Path(path)
         image = imread(path)

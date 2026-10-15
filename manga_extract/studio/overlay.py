@@ -21,10 +21,11 @@ from .project import PageData
 
 @dataclass
 class _Box:
-    """The two attributes ``typeset`` reads from a block."""
+    """The attributes ``typeset`` reads from a block."""
 
     xyxy: List[int]
     vertical: bool
+    font_size: int = 0
 
 
 def has_translation(data: "PageData | None") -> bool:
@@ -51,7 +52,7 @@ class OverlayRenderer(QObject):
         """Render ``data``'s translations over the page image (asynchronous)."""
         if self._closed:
             return                          # a debounce timer can still fire after shutdown
-        boxes = [_Box(list(block.bbox), block.vertical) for block in data.blocks]
+        boxes = [_Box(list(block.bbox), block.vertical, block.font_size) for block in data.blocks]
         translations = data.translations()
         self._latest[page_id] = version
         self._executor.submit(self._work, page_id, version, str(image_path), boxes, translations)

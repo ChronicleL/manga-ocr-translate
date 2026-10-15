@@ -56,6 +56,19 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
 # Per-page data
 # ---------------------------------------------------------------------------
 
+MAX_BLOCK_FONT_SIZE = 200
+MIN_BBOX = 8          # minimum width and height of a text block in pixels
+
+
+def _font_size(value: Any) -> int:
+    """A stored font size, 0 (automatic) when missing or nonsense."""
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return size if 0 < size <= MAX_BLOCK_FONT_SIZE else 0
+
+
 @dataclass
 class BlockData:
     """One text block of a page, in reading order."""
@@ -69,6 +82,7 @@ class BlockData:
     reviewed: bool = False
     source_edited: bool = False  # True once the user changed the OCR text
     translation_edited: bool = False  # True once the user typed the translation by hand
+    font_size: int = 0          # 0 = fit automatically, otherwise the typeset size in pixels
 
     @property
     def xyxy(self) -> List[int]:
@@ -123,6 +137,7 @@ class BlockData:
             "reviewed": bool(self.reviewed),
             "source_edited": bool(self.source_edited),
             "translation_edited": bool(self.translation_edited),
+            "font_size": int(self.font_size),
         }
 
     @classmethod
@@ -141,6 +156,7 @@ class BlockData:
             reviewed=bool(data.get("reviewed", False)),
             source_edited=bool(data.get("source_edited", False)),
             translation_edited=bool(data.get("translation_edited", False)),
+            font_size=_font_size(data.get("font_size", 0)),
         )
 
 
@@ -200,6 +216,33 @@ class PageData:
             height=int(data.get("height", 0)),
             blocks=[BlockData.from_dict(b) for b in data.get("blocks", [])],
         )
+
+    # -- block editing -------------------------------------------------------
+    def add_block(self, bbox: List[int]) -> int:
+        """Append an empty block with ``bbox``; returns its index."""
+        x1, y1, x2, y2 = bbox
+        x1 = max(0, min(x1, self.width)); y1 = max(0, min(y1, self.height))
+        x2 = max(x1 + MIN_BBOX, min(x2, self.width))
+        y2 = max(y1 + MIN_BBOX, min(y2, self.height))
+        self.blocks.append(BlockData(bbox=[x1, y1, x2, y2]))
+        return len(self.blocks) - 1
+
+    def remove_block(self, index: int) -> None:
+        if 0 <= index < len(self.blocks):
+            del self.blocks[index]
+
+    def set_bbox(self, index: int, bbox: List[int]) -> bool:
+        """Clamp and update a block's bbox; returns True when actually changed."""
+        if not 0 <= index < len(self.blocks):
+            return False
+        x1, y1, x2, y2 = bbox
+        x1 = max(0, min(x1, self.width - MIN_BBOX)); y1 = max(0, min(y1, self.height - MIN_BBOX))
+        x2 = max(x1 + MIN_BBOX, min(x2, self.width)); y2 = max(y1 + MIN_BBOX, min(y2, self.height))
+        new = [x1, y1, x2, y2]
+        if self.blocks[index].bbox == new:
+            return False
+        self.blocks[index].bbox = new
+        return True
 
     def status(self) -> str:
         texty = [block for block in self.blocks if block.has_text]

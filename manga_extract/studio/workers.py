@@ -138,6 +138,8 @@ class EngineSignals(QObject):
     progress = Signal(str, str, int, int)  # page id, stage ("detect" | "ocr"), done, total
     recognized = Signal(str, object)     # page id, PageData
     failed = Signal(str, str)            # page id, message
+    regionRecognized = Signal(str, str, object)   # page_id, req_id, ExtractedBlock|None
+    regionFailed = Signal(str, str, str)           # page_id, req_id, message
 
 
 class EngineWorker:
@@ -177,6 +179,11 @@ class EngineWorker:
             self._pending.add(page_id)
         self._jobs.put(("recognize", page_id, str(image_path), token))
 
+    def submit_region(self, page_id: str, image_path: str | Path,
+                      xyxy: list, req_id: str) -> None:
+        """Queue a single-block re-detection; ``req_id`` is caller-assigned."""
+        self._jobs.put(("region", page_id, str(image_path), list(xyxy), req_id))
+
     def discard(self, page_id: str) -> None:
         """Forget a page: queued jobs are skipped, a running one is not reported."""
         with self._lock:
@@ -199,8 +206,10 @@ class EngineWorker:
                 return
             if job[0] == "load":
                 self._load()
-            else:
+            elif job[0] == "recognize":
                 self._recognize(*job[1:])
+            elif job[0] == "region":
+                self._recognize_region(*job[1:])
 
     def _load(self) -> None:
         # Drop the old models first: holding two copies of the OCR model would double the peak.
@@ -247,3 +256,19 @@ class EngineWorker:
             with self._lock:
                 self._tokens.pop(page_id, None)
             self.signals.recognized.emit(page_id, data)
+
+    def _recognize_region(self, page_id: str, image_path: str,
+                           xyxy: list, req_id: str) -> None:
+        if self._extractor is None:
+            self.signals.regionFailed.emit(
+                page_id, req_id, f"识别引擎未能加载：{self._load_error or '请稍候'}")
+            return
+        try:
+            image = self._read_image(image_path)
+            if image is None:
+                raise OSError(f"无法读取图片：{image_path}")
+            block = self._extractor.redetect_region(image, xyxy)
+        except Exception as exc:  # noqa: BLE001
+            self.signals.regionFailed.emit(page_id, req_id, f"{type(exc).__name__}: {exc}")
+            return
+        self.signals.regionRecognized.emit(page_id, req_id, block)
