@@ -158,12 +158,17 @@ class GoogleTranslator(BaseTranslator):
     name = "google"
     URL = "https://clients5.google.com/translate_a/t"
 
+    def __init__(self, target_lang: str = "zh-CN", source_lang: str = "ja",
+                 timeout: float = 25.0) -> None:
+        super().__init__(target_lang=target_lang, timeout=timeout)
+        self.source_lang = source_lang
+
     def translate(self, texts: Sequence[str]) -> List[str]:
         results: List[str] = []
         for chunk in _chunked(list(texts), max_items=6, max_chars=700):
             params: List[Tuple[str, str]] = [
                 ("client", "dict-chrome-ex"),
-                ("sl", "ja"),
+                ("sl", self.source_lang),
                 ("tl", self.target_lang),
             ]
             params += [("q", text) for text in chunk]
@@ -177,7 +182,7 @@ class GoogleTranslator(BaseTranslator):
 
     def _translate_one(self, text: str) -> str:
         params = urllib.parse.urlencode(
-            {"client": "dict-chrome-ex", "sl": "ja", "tl": self.target_lang, "q": text}
+            {"client": "dict-chrome-ex", "sl": self.source_lang, "tl": self.target_lang, "q": text}
         )
         return self._as_list(_http_get_json(f"{self.URL}?{params}", self.timeout))[0]
 
@@ -204,11 +209,17 @@ class YoudaoTranslator(BaseTranslator):
     URL = "https://aidemo.youdao.com/trans"
     _TO = {"zh-CN": "zh-CHS", "zh-TW": "zh-CHT", "en": "en"}
 
+    def __init__(self, target_lang: str = "zh-CN", source_lang: str = "ja",
+                 timeout: float = 25.0) -> None:
+        super().__init__(target_lang=target_lang, timeout=timeout)
+        self.source_lang = source_lang
+
     def translate(self, texts: Sequence[str]) -> List[str]:
         results: List[str] = []
         for chunk in _chunked(list(texts), max_items=10, max_chars=900):
             params = urllib.parse.urlencode(
-                {"q": "\n".join(chunk), "from": "ja", "to": self._TO.get(self.target_lang, "zh-CHS")}
+                {"q": "\n".join(chunk), "from": self.source_lang,
+                 "to": self._TO.get(self.target_lang, "zh-CHS")}
             )
             data = _http_get_json(f"{self.URL}?{params}", self.timeout)
             if not isinstance(data, dict) or str(data.get("errorCode")) != "0":
@@ -221,7 +232,7 @@ class YoudaoTranslator(BaseTranslator):
 
     def _translate_one(self, text: str) -> str:
         params = urllib.parse.urlencode(
-            {"q": text, "from": "ja", "to": self._TO.get(self.target_lang, "zh-CHS")}
+            {"q": text, "from": self.source_lang, "to": self._TO.get(self.target_lang, "zh-CHS")}
         )
         data = _http_get_json(f"{self.URL}?{params}", self.timeout)
         if not isinstance(data, dict) or str(data.get("errorCode")) != "0":
@@ -235,8 +246,15 @@ class MyMemoryTranslator(BaseTranslator):
     name = "mymemory"
     URL = "https://api.mymemory.translated.net/get"
 
+    def __init__(self, target_lang: str = "zh-CN", source_lang: str = "ja",
+                 timeout: float = 25.0) -> None:
+        super().__init__(target_lang=target_lang, timeout=timeout)
+        self.source_lang = source_lang
+
     def _translate_one(self, text: str) -> str:
-        params = urllib.parse.urlencode({"q": text[:500], "langpair": f"ja|{self.target_lang}"})
+        params = urllib.parse.urlencode(
+            {"q": text[:500], "langpair": f"{self.source_lang}|{self.target_lang}"}
+        )
         data = _http_get_json(f"{self.URL}?{params}", self.timeout)
         if not isinstance(data, dict):
             raise TranslationError("MyMemory 返回了意外的数据")
@@ -273,22 +291,26 @@ class AITranslator(BaseTranslator):
     # Assembled from three parts so a user-supplied style requirement lands
     # *before* the output-format rules instead of trailing them: instructions
     # placed last tend to be outweighed by an earlier default tone.
-    PROMPT_HEAD = "你是资深的日文漫画翻译。\n\n【风格要求（优先于默认语气，必须严格遵守）】\n"
     DEFAULT_STYLE = "译文要自然、口语化。"
-    PROMPT_TAIL = (
-        "\n\n【输出格式】\n"
-        "把用户给出的每一条日文按上面的风格翻译成简体中文，保持条目数量与顺序完全不变，"
-        "不要合并或拆分条目，不要加解释。只输出一个 JSON 字符串数组，每个元素对应一条译文。"
-    )
+    _LANG_NAMES = {"ja": "日文", "ko": "韩文", "en": "英文"}
 
-    def __init__(self, config: AIConfig, target_lang: str = "zh-CN") -> None:
+    def __init__(self, config: AIConfig, target_lang: str = "zh-CN",
+                 source_lang: str = "ja") -> None:
         super().__init__(target_lang=target_lang, timeout=config.timeout)
         self.config = config
+        self.source_lang = source_lang
 
     def system_prompt(self) -> str:
         """Built-in role/format rules with the user's style requirement inside."""
+        src_name = self._LANG_NAMES.get(self.source_lang, self.source_lang)
+        head = f"你是资深的{src_name}漫画翻译。\n\n【风格要求（优先于默认语气，必须严格遵守）】\n"
+        tail = (
+            "\n\n【输出格式】\n"
+            f"把用户给出的每一条{src_name}按上面的风格翻译成简体中文，保持条目数量与顺序完全不变，"
+            "不要合并或拆分条目，不要加解释。只输出一个 JSON 字符串数组，每个元素对应一条译文。"
+        )
         style = (self.config.prompt or "").strip() or self.DEFAULT_STYLE
-        return f"{self.PROMPT_HEAD}{style}{self.PROMPT_TAIL}"
+        return f"{head}{style}{tail}"
 
     def translate(self, texts: Sequence[str]) -> List[str]:
         items = list(texts)
@@ -369,6 +391,7 @@ class TranslationConfig:
     mode: str = "web"                 # "web" | "ai"
     web_engine: str = "google"        # google | youdao | mymemory
     target_lang: str = "zh-CN"
+    source_lang: str = "ja"           # "ja" | "ko" | "en"
     ai: AIConfig = field(default_factory=AIConfig)
     ai_profiles: List[AIConfig] = field(default_factory=list)
 
@@ -380,6 +403,7 @@ class TranslationConfig:
             "mode": self.mode,
             "web_engine": self.web_engine,
             "target_lang": self.target_lang,
+            "source_lang": self.source_lang,
             "ai": asdict(self.ai),
             "ai_profiles": [asdict(profile) for profile in self.ai_profiles],
         }
@@ -392,6 +416,7 @@ class TranslationConfig:
             mode=data.get("mode", "web"),
             web_engine=data.get("web_engine", "google"),
             target_lang=data.get("target_lang", "zh-CN"),
+            source_lang=data.get("source_lang", "ja"),
             ai=_ai_config(data.get("ai")),
             ai_profiles=profiles,
         )
@@ -438,16 +463,17 @@ class TranslationConfig:
 
     def build_translator(self) -> BaseTranslator:
         """Create the translator selected by this configuration."""
+        sl = self.source_lang or "ja"
         if self.mode == "ai":
             if not self.ai.api_key:
                 raise TranslationError("AI 翻译需要先在「翻译设置」里填写 API Key")
             if not self.ai.model:
                 raise TranslationError("AI 翻译需要先填写模型名称")
-            return AITranslator(self.ai, target_lang=self.target_lang)
+            return AITranslator(self.ai, target_lang=self.target_lang, source_lang=sl)
         engines = {
             "google": GoogleTranslator,
             "youdao": YoudaoTranslator,
             "mymemory": MyMemoryTranslator,
         }
         translator = engines.get(self.web_engine, GoogleTranslator)
-        return translator(target_lang=self.target_lang)
+        return translator(target_lang=self.target_lang, source_lang=sl)

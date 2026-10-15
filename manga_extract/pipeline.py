@@ -12,6 +12,9 @@ from .detector import ComicTextDetector, PageDetection
 from .image_io import imread
 from .reading_order import TextBlock, group_text_lines
 
+# Sentinel key for the catch-all / primary recognizer in the dict.
+_DEFAULT_LANG = "default"
+
 
 @dataclass
 class ExtractedLine:
@@ -110,19 +113,33 @@ def _recognize_all(recognizer: Any, crops: Sequence[np.ndarray],
 
 
 class MangaExtractor:
-    """Detect, order and read Japanese text from manga page images."""
+    """Detect, order and read text from manga page images.
+
+    Supports routing detected blocks to different recognizers by language:
+    ``recognizers["eng"]`` handles English blocks, ``recognizers["default"]``
+    (or the legacy ``recognizer`` kwarg) handles everything else.
+    """
 
     def __init__(
         self,
         detector: Optional[ComicTextDetector] = None,
-        recognizer: Optional[Any] = None,
+        recognizer: Optional[Any] = None,       # legacy single-recognizer param
+        recognizers: Optional[Dict[str, Any]] = None,   # lang → recognizer
         model_path: str | Path = "models/comic-text-detector.onnx",
         channel_order: str = "bgr",
     ) -> None:
         if detector is None:
             detector = ComicTextDetector(model_path, channel_order=channel_order)
         self.detector = detector
-        self._recognizer = recognizer
+        # Build the internal recognizer dict. Legacy ``recognizer=`` wraps to "default".
+        if recognizers is not None:
+            self._recognizers: Dict[str, Any] = recognizers
+        elif recognizer is not None:
+            self._recognizers = {_DEFAULT_LANG: recognizer}
+        else:
+            self._recognizers = {}
+        # Keep a legacy alias for code that reads ._recognizer directly.
+        self._recognizer = self._recognizers.get(_DEFAULT_LANG)
 
     def load_recognizer(self):
         """Create the default OCR recognizer on demand."""
@@ -162,16 +179,22 @@ class MangaExtractor:
         """
         detection, blocks = self.extract_blocks(image)
 
-        recognizer = self._recognizer
         result_blocks: List[ExtractedBlock] = []
-        slots: List[Tuple[int, int]] = []  # (block index, line index)
-        crops: List[np.ndarray] = []
+        # lang_slots: per-recognizer key → [(block_idx, line_idx, crop)]
+        lang_slots: Dict[str, List[Tuple[int, int, np.ndarray]]] = {}
+        total_crops = 0
+
         for block in blocks:
             extracted = ExtractedBlock(
                 xyxy=list(block.xyxy),
                 language=block.language,
                 vertical=block.vertical,
             )
+            # Pick the recognizer for this block's language; fall back to "default".
+            rec_key = (block.language
+                       if block.language in self._recognizers
+                       else _DEFAULT_LANG)
+            rec = self._recognizers.get(rec_key)
             for polygon in block.lines:
                 extracted.lines.append(
                     ExtractedLine(
@@ -179,24 +202,36 @@ class MangaExtractor:
                         text="",
                     )
                 )
-                if recognizer is not None:
+                if rec is not None:
                     crop = crop_polygon_region(image, polygon)
                     if crop is not None:
-                        slots.append((len(result_blocks), len(extracted.lines) - 1))
-                        crops.append(crop)
+                        lang_slots.setdefault(rec_key, []).append(
+                            (len(result_blocks), len(extracted.lines) - 1, crop))
+                        total_crops += 1
             result_blocks.append(extracted)
 
         if on_progress:
-            on_progress("detect", len(blocks), len(crops))
+            on_progress("detect", len(blocks), total_crops)
 
-        # Every crop goes through the recognizer at once so a batching
-        # recognizer can fill a single forward pass instead of one per line.
-        if recognizer is not None and crops:
-            ocr_cb = (lambda d, t: on_progress("ocr", d, t)) if on_progress else None
-            for (block_index, line_index), text in zip(
-                slots, _recognize_all(recognizer, crops, on_progress=ocr_cb)
-            ):
-                result_blocks[block_index].lines[line_index].text = text
+        # Run each recognizer over its own batch; progress counts across all.
+        if lang_slots:
+            ocr_done = 0
+
+            def _progress(done: int, total: int) -> None:
+                nonlocal ocr_done
+                ocr_done += done - getattr(_progress, "_prev", 0)
+                setattr(_progress, "_prev", done)
+                if on_progress:
+                    on_progress("ocr", ocr_done, total_crops)
+
+            for rec_key, slot_list in lang_slots.items():
+                rec = self._recognizers[rec_key]
+                crops_for_rec = [crop for _, _, crop in slot_list]
+                _progress._prev = 0  # type: ignore[attr-defined]
+                ocr_cb = _progress if on_progress else None
+                texts = _recognize_all(rec, crops_for_rec, on_progress=ocr_cb)
+                for (block_index, line_index, _), text in zip(slot_list, texts):
+                    result_blocks[block_index].lines[line_index].text = text
 
         return PageResult(
             source=source,

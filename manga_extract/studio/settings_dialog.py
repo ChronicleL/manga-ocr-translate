@@ -59,6 +59,7 @@ def apply_translation_settings(target: TranslationConfig, edited: TranslationCon
     """Copy the edited settings into ``target`` *in place* (the window keeps one object)."""
     target.web_engine = edited.web_engine
     target.target_lang = edited.target_lang
+    target.source_lang = edited.source_lang
     target.ai_profiles = edited.ai_profiles
     target.ai = edited.ai
     target.ensure_profiles()
@@ -110,6 +111,7 @@ class SettingsDialog(QDialog):
         column.addWidget(self._build_ai_card())
         if style is not None:
             column.addWidget(self._build_typeset_card(*style))
+        column.addWidget(self._build_lang_card(self.engine))
         column.addWidget(self._build_perf_card(devices))
         column.addStretch(1)
 
@@ -270,6 +272,49 @@ class SettingsDialog(QDialog):
         box.addWidget(hint)
         return frame
 
+    _LANG_LABELS = {"ja": "日文", "ko": "韩文"}
+    _LANG_CODES  = {"日文": "ja", "韩文": "ko"}
+
+    def _build_lang_card(self, engine_config: EngineConfig) -> QFrame:
+        from ..runtime import PRIMARY_LANGS  # noqa: PLC0415
+
+        frame, box = self._card("OCR 语言")
+        self.primary_lang_box = ComboBox(frame)
+        for code in PRIMARY_LANGS:
+            self.primary_lang_box.addItem(self._LANG_LABELS.get(code, code))
+        current_label = self._LANG_LABELS.get(engine_config.primary_lang, "日文")
+        self.primary_lang_box.setCurrentText(current_label)
+
+        self.eng_ocr_check = CheckBox("英文 OCR（为检测到的英文块单独识别）", frame)
+        self.eng_ocr_check.setChecked(engine_config.eng_ocr_enabled)
+
+        self.eng_model_edit = LineEdit(frame)
+        self.eng_model_edit.setText(engine_config.eng_ocr_model)
+        self.eng_model_edit.setPlaceholderText("HuggingFace 模型 ID，如 microsoft/trocr-base-printed")
+
+        self.ko_model_edit = LineEdit(frame)
+        self.ko_model_edit.setText(engine_config.ko_ocr_model)
+        self.ko_model_edit.setPlaceholderText("韩文 OCR 模型 ID，如 snoop2head/deep-korean-ocr")
+
+        hint = CaptionLabel(
+            "主语言为韩文时，检测器未识别为英文的所有文字块都会走韩文 OCR；"
+            "英文 OCR 和韩文 OCR 首次使用时自动从 HuggingFace 下载，需要网络连接。", frame)
+        hint.setWordWrap(True)
+
+        def _toggle_ko_visible():
+            is_ko = self._LANG_CODES.get(self.primary_lang_box.currentText(), "ja") == "ko"
+            self.ko_model_edit.setEnabled(is_ko)
+
+        self.primary_lang_box.currentIndexChanged.connect(lambda _: _toggle_ko_visible())
+        _toggle_ko_visible()
+
+        box.addLayout(self._row("主要语言", self.primary_lang_box, stretch=-1))
+        box.addLayout(self._row("英文 OCR", self.eng_ocr_check, stretch=-1))
+        box.addLayout(self._row("英文模型", self.eng_model_edit))
+        box.addLayout(self._row("韩文模型", self.ko_model_edit))
+        box.addWidget(hint)
+        return frame
+
     def _build_perf_card(self, devices: List[str]) -> QFrame:
         frame, box = self._card("性能（保存后自动重新加载模型）")
         self.device_box = ComboBox(frame)
@@ -414,6 +459,9 @@ class SettingsDialog(QDialog):
         self.store_profile()
         self.config.web_engine = WEB_ENGINES.get(self.engine_box.currentText(), "google")
         self.config.target_lang = TARGET_LANGUAGES.get(self.lang_box.currentText(), "zh-CN")
+        # source_lang driven by primary_lang selection
+        primary_lang = self._LANG_CODES.get(self.primary_lang_box.currentText(), "ja")
+        self.config.source_lang = primary_lang
         self.result_translation = self.config
         if self._style is not None:
             self.result_style = (self._font_paths[self.font_box.currentIndex()],
@@ -423,6 +471,12 @@ class SettingsDialog(QDialog):
             batch = int(self.batch_box.currentText())
         except ValueError:
             batch = 1
-        self.result_engine = EngineConfig(device=code, threads=parse_threads(self.threads_edit.text()),
-                                          ocr_batch=min(MAX_OCR_BATCH, max(1, batch))).normalized()
+        self.result_engine = EngineConfig(
+            device=code, threads=parse_threads(self.threads_edit.text()),
+            ocr_batch=min(MAX_OCR_BATCH, max(1, batch)),
+            primary_lang=primary_lang,
+            ko_ocr_model=self.ko_model_edit.text().strip(),
+            eng_ocr_enabled=self.eng_ocr_check.isChecked(),
+            eng_ocr_model=self.eng_model_edit.text().strip(),
+        ).normalized()
         super().accept()

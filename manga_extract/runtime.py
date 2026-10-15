@@ -25,6 +25,8 @@ OCR_BATCH_CHOICES = (1, 2, 4, 8, 12, 16)
 MAX_OCR_BATCH = 16
 
 
+PRIMARY_LANGS = ("ja", "ko")     # detector can't output "ko", so ko = treat "ja"/"unknown" as Korean
+
 @dataclass
 class EngineConfig:
     """How the detector and the OCR recognizer should run."""
@@ -32,6 +34,11 @@ class EngineConfig:
     device: str = "auto"   # auto | cpu | cuda | dml | openvino
     threads: int = 0       # 0 = let each backend pick its own default
     ocr_batch: int = 1     # text lines per forward pass
+    # Multilingual OCR
+    primary_lang: str = "ja"    # "ja" | "ko"  — language of non-English blocks
+    ko_ocr_model: str = ""      # HuggingFace model id for Korean; empty = not enabled
+    eng_ocr_enabled: bool = True
+    eng_ocr_model: str = "microsoft/trocr-base-printed"  # empty = disabled
 
     def normalized(self) -> "EngineConfig":
         """Clamp values into a usable range, dropping unavailable devices."""
@@ -44,7 +51,12 @@ class EngineConfig:
             batch = min(MAX_OCR_BATCH, max(1, int(self.ocr_batch)))
         except (TypeError, ValueError):
             batch = 1
-        return EngineConfig(device=device, threads=threads, ocr_batch=batch)
+        primary_lang = self.primary_lang if self.primary_lang in PRIMARY_LANGS else "ja"
+        return EngineConfig(device=device, threads=threads, ocr_batch=batch,
+                            primary_lang=primary_lang,
+                            ko_ocr_model=str(self.ko_ocr_model or "").strip(),
+                            eng_ocr_enabled=bool(self.eng_ocr_enabled),
+                            eng_ocr_model=str(self.eng_ocr_model or "").strip())
 
     def to_dict(self) -> dict:
         return asdict(self)

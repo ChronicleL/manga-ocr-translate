@@ -44,16 +44,49 @@ def default_extractor_factory(model_path: Path, engine_config_path: Path,
         if not Path(model_path).is_file():
             raise FileNotFoundError(
                 f"找不到检测模型：{model_path}\n请先运行 scripts/download_models.py")
+        from ..recognizer import TrOCRRecognizer
+
         engine = EngineConfig.load(engine_config_path)
         detector = ComicTextDetector(model_path, device=engine.device, threads=engine.threads)
-        recognizer = MangaOcrRecognizer(
-            hf_endpoint=hf_endpoint, device=engine.device,
-            threads=engine.threads, batch_size=engine.ocr_batch)
-        extractor = MangaExtractor(detector=detector, recognizer=recognizer)
+
+        # Primary recognizer (Japanese or Korean).
+        recognizers: dict = {}
+        if engine.primary_lang == "ko" and engine.ko_ocr_model:
+            primary = TrOCRRecognizer(
+                engine.ko_ocr_model, device=engine.device,
+                threads=engine.threads, batch_size=engine.ocr_batch,
+                hf_endpoint=hf_endpoint,
+            )
+            recognizers["default"] = primary
+            ocr_device = primary.device
+        else:
+            if engine.primary_lang == "ko":
+                import warnings
+                warnings.warn(
+                    "主语言设为韩文但未填写韩文模型，回退到日文 OCR", stacklevel=1)
+            primary = MangaOcrRecognizer(
+                hf_endpoint=hf_endpoint, device=engine.device,
+                threads=engine.threads, batch_size=engine.ocr_batch,
+            )
+            recognizers["default"] = primary
+            ocr_device = primary.device
+
+        # Optional English recognizer.
+        if engine.eng_ocr_enabled and engine.eng_ocr_model:
+            eng = TrOCRRecognizer(
+                engine.eng_ocr_model, device=engine.device,
+                threads=engine.threads, batch_size=engine.ocr_batch,
+                hf_endpoint=hf_endpoint,
+            )
+            recognizers["eng"] = eng
+
+        extractor = MangaExtractor(detector=detector, recognizers=recognizers)
         backend = detector.providers[0].replace("ExecutionProvider", "")
         if backend == "CPU":
             backend += "（未启用 GPU 加速）"
-        return extractor, f"检测 {backend} · OCR {recognizer.device}"
+        lang_tag = {"ja": "日", "ko": "韩"}.get(engine.primary_lang, engine.primary_lang)
+        eng_tag = "+英" if "eng" in recognizers else ""
+        return extractor, f"检测 {backend} · OCR {ocr_device}（{lang_tag}{eng_tag}文）"
 
     return build
 

@@ -20,6 +20,7 @@ import numpy as np
 from PIL import Image
 
 DEFAULT_MODEL = "kha-white/manga-ocr-base"
+DEFAULT_ENG_MODEL = "microsoft/trocr-base-printed"
 MAX_NEW_TOKENS = 300
 
 
@@ -106,7 +107,7 @@ class MangaOcrRecognizer:
                 on_progress(done, total)
         return results
 
-    def _decode(self, images: List[Image.Image]) -> List[str]:
+    def _decode(self, images: "List[Image.Image]") -> List[str]:
         """Run the VisionEncoderDecoder over a batch of PIL crops."""
         ocr = self._ocr
         try:
@@ -124,3 +125,101 @@ class MangaOcrRecognizer:
             )
         decoded = ocr.tokenizer.batch_decode(generated, skip_special_tokens=True)
         return [post_process(text) for text in decoded]
+
+
+class TrOCRRecognizer:
+    """Generic VisionEncoderDecoder recognizer for non-Japanese languages.
+
+    Uses ``transformers`` directly (no manga-ocr post-processing) so it can
+    handle any compatible model — e.g. English ``microsoft/trocr-base-printed``
+    or a user-supplied Korean model.
+
+    Provides the same ``recognize`` / ``recognize_many`` interface as
+    :class:`MangaOcrRecognizer` so it is a drop-in alternative in the pipeline.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        device: str = "auto",
+        threads: int = 0,
+        batch_size: int = 1,
+        hf_endpoint: Optional[str] = None,
+    ) -> None:
+        if hf_endpoint:
+            os.environ["HF_ENDPOINT"] = hf_endpoint
+
+        import torch
+        from transformers import AutoProcessor, VisionEncoderDecoderModel
+
+        if threads and threads > 0:
+            torch.set_num_threads(threads)
+
+        # TrOCR runs on CUDA or CPU; DML is not officially supported.
+        if device == "auto":
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+        elif device == "cpu":
+            dev = "cpu"
+        else:
+            dev = "cpu"          # unknown/DML → CPU fallback
+
+        self._processor = AutoProcessor.from_pretrained(model_name)
+        self._model = VisionEncoderDecoderModel.from_pretrained(model_name).to(dev)
+        self._model.eval()
+        self._torch = torch
+        self.device = dev
+        self.batch_size = max(1, int(batch_size))
+        self.threads = torch.get_num_threads()
+
+    # -- pre-processing (identical to MangaOcrRecognizer) -------------------
+    @staticmethod
+    def _to_pil(image_bgr: np.ndarray) -> Image.Image:
+        if image_bgr.ndim == 2:
+            rgb = image_bgr
+        else:
+            rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(rgb).convert("L").convert("RGB")
+
+    def recognize(self, image_bgr: np.ndarray) -> str:
+        if image_bgr is None or image_bgr.size == 0:
+            return ""
+        pil = self._to_pil(image_bgr)
+        pixel_values = (self._processor(pil, return_tensors="pt")
+                        .pixel_values.to(self._model.device))
+        with self._torch.inference_mode():
+            generated = self._model.generate(pixel_values, max_new_tokens=MAX_NEW_TOKENS)
+        return self._processor.batch_decode(generated, skip_special_tokens=True)[0]
+
+    __call__ = recognize
+
+    def recognize_many(self, images: Sequence[np.ndarray],
+                       on_progress=None) -> List[str]:
+        results = [""] * len(images)
+        total = len(images)
+        if self.batch_size <= 1:
+            for index, image in enumerate(images):
+                results[index] = self.recognize(image)
+                if on_progress:
+                    on_progress(index + 1, total)
+            return results
+
+        pending = [
+            (index, self._to_pil(image))
+            for index, image in enumerate(images)
+            if image is not None and image.size
+        ]
+        done = 0
+        for start in range(0, len(pending), self.batch_size):
+            chunk = pending[start:start + self.batch_size]
+            pils = [pil for _, pil in chunk]
+            pixel_values = (self._processor(pils, return_tensors="pt", padding=True)
+                            .pixel_values.to(self._model.device))
+            with self._torch.inference_mode():
+                generated = self._model.generate(pixel_values, max_new_tokens=MAX_NEW_TOKENS)
+            texts = self._processor.batch_decode(generated, skip_special_tokens=True)
+            for (index, _), text in zip(chunk, texts):
+                results[index] = text
+            done += len(chunk)
+            if on_progress:
+                on_progress(done, total)
+        return results
