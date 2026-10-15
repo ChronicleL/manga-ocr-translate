@@ -31,6 +31,32 @@
 - `packaging/build_release.ps1` 里压缩用的 tar 路径含一个制表符（`System32<TAB>ar.exe`），会让压缩步骤必然失败，现已修正。
 - **测试**：新增 `tests/`，覆盖数据层、画布、校对栏、翻译与编辑流程、截图遮罩、网页导入（对着本地假网站）、设置、导出、快捷键、`--selftest`。不加载任何模型，界面用离屏平台，不需要显示器。
 
+---
+
+### 近期改进
+
+#### 竖排排版与字体字号（`typeset.py` / `studio/`）
+
+- **竖排符号修正**：`…` `—` `～` 等横向符号自动旋转 90° 居中，省略号不再横着画。`，。、` 靠格子右上角，`「」（）【】` 优先使用字体竖排字形，没有时旋转。标点不出现在列首（避头），`\n` 强制换列，1–2 位数字/字母横排一格。
+- **字体选择**：设置窗口新增「译文排版」卡片，字体下拉自动扫描系统内已安装的 CJK 字体，字号倍率（60%–200%）缩放自动字号的上限。
+- **单块字号**：校对卡片「译文」旁新增字号下拉（自动、12、14…64），固定字号；0 = 自动适配文本框大小。字号存入块数据，旧项目文件向后兼容。
+
+#### 检测框可编辑 + 区域重新检测（`canvas.py` / `pipeline.py` / `workers.py`）
+
+- **手柄拖动**：选中文本框后出现 8 个调整手柄，可拖动缩放或整体移动；空白处左键仍平移画布。
+- **右键菜单**：框上 → 「重新检测此框」「删除此框」；空白处 → 「在此新增文字框」（80px 默认框，拖手柄调整大小）。
+- **区域重新检测**：在裁剪区上用宽松阈值（conf≈0.2）重跑检测和 OCR；检测不到行时整框作单行。只更新原文/方向，不动已有译文和已校对标记；人工改动过的块先弹确认。
+- **数据层**：`PageData` 新增 `add_block` / `remove_block` / `set_bbox`，含 8px 最小尺寸约束。
+
+#### 多语言 OCR（路线 A：韩文 + 英文）
+
+- **`TrOCRRecognizer`**：基于原生 transformers 的通用识别器，支持任何 VisionEncoderDecoder 模型，与日文识别器接口相同。
+- **Pipeline 多路由**：检测器将块标记为 "eng"/"ja"/"unknown"；"eng" 走英文识别器，其余走主语言识别器（日文或韩文）。
+- **设置「OCR 语言」卡片**：切换主要语言（日/韩），开关英文 OCR，填写韩文/英文模型 ID；模型首次使用时从 HuggingFace 自动下载。
+- **翻译 `source_lang`**：Google / 有道 / MyMemory 的源语言参数和 AI 提示词均已动态化，选韩文时翻译引擎随之切换。
+- **推荐模型**：英文 `microsoft/trocr-base-printed`（默认，~334 MB）；韩文目前无官方漫画专用模型，设置里填写 HF model id 后即可使用。
+- 旧版 `engine_config.json` 和 `translate_config.json` 向后兼容，升级无需手动迁移。
+
 #### Changed
 - 项目文件里的 `data/*.json` 在 `PageResult.to_dict()` 基础上增加 `source`、`translation`、`reviewed`、`source_edited`、`translation_edited`；旧格式（只有 `text`）仍可读取。
 - `EngineWorker.reload()`、`pipeline.extract_page(on_progress=…)`、`recognizer.recognize_many(on_progress=…)`：供 Studio 使用的引擎接口，旧接口行为不变。
