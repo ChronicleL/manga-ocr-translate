@@ -132,24 +132,39 @@ def _chunked(items: Sequence[str], max_items: int, max_chars: int) -> List[List[
 # --------------------------------------------------------------------------- #
 # Backends
 # --------------------------------------------------------------------------- #
+import time as _time   # noqa: E402 – placed here to keep the module header clean
+
+
 class BaseTranslator:
     """Translate a list of strings, preserving order."""
 
     name = "base"
-    # Seconds to sleep between consecutive page-level jobs when translating
-    # multiple pages at once.  Web engines need this to avoid rate-limiting;
-    # AI engines are already slow enough that no extra delay is required.
+    # Seconds to sleep between consecutive PAGE-level jobs (enforced by the worker thread).
     inter_page_delay: float = 2.0
+    # Seconds to sleep between consecutive HTTP requests *within* a single page.
+    # Set by each subclass according to how strict its endpoint is.
+    inter_chunk_delay: float = 0.0
 
     def __init__(self, target_lang: str = "zh-CN", timeout: float = 25.0) -> None:
         self.target_lang = target_lang
         self.timeout = timeout
 
     def translate(self, texts: Sequence[str]) -> List[str]:
-        return [self._translate_one(text) for text in texts]
+        results = []
+        items = list(texts)
+        for i, text in enumerate(items):
+            results.append(self._translate_one(text))
+            if i < len(items) - 1:
+                self._chunk_sleep()
+        return results
 
     def _translate_one(self, text: str) -> str:
         raise NotImplementedError
+
+    def _chunk_sleep(self) -> None:
+        """Call after each HTTP request inside a multi-chunk translate() loop."""
+        if self.inter_chunk_delay > 0:
+            _time.sleep(self.inter_chunk_delay)
 
 
 class GoogleTranslator(BaseTranslator):
@@ -161,6 +176,8 @@ class GoogleTranslator(BaseTranslator):
 
     name = "google"
     URL = "https://clients5.google.com/translate_a/t"
+    inter_page_delay: float = 1.5
+    inter_chunk_delay: float = 0.5
 
     def __init__(self, target_lang: str = "zh-CN", source_lang: str = "ja",
                  timeout: float = 25.0) -> None:
@@ -169,7 +186,8 @@ class GoogleTranslator(BaseTranslator):
 
     def translate(self, texts: Sequence[str]) -> List[str]:
         results: List[str] = []
-        for chunk in _chunked(list(texts), max_items=6, max_chars=700):
+        chunks = list(_chunked(list(texts), max_items=6, max_chars=700))
+        for i, chunk in enumerate(chunks):
             params: List[Tuple[str, str]] = [
                 ("client", "dict-chrome-ex"),
                 ("sl", self.source_lang),
@@ -182,6 +200,8 @@ class GoogleTranslator(BaseTranslator):
                 # Fall back to one request per item if the batch misbehaves.
                 values = [self._translate_one(text) for text in chunk]
             results.extend(values)
+            if i < len(chunks) - 1:
+                self._chunk_sleep()
         return results
 
     def _translate_one(self, text: str) -> str:
@@ -207,11 +227,16 @@ class GoogleTranslator(BaseTranslator):
 
 
 class YoudaoTranslator(BaseTranslator):
-    """Free 有道 demo endpoint; newline-joined input comes back line-aligned."""
+    """Free 有道 demo endpoint; newline-joined input comes back line-aligned.
+
+    有道免费 Demo 限速极严（errorCode 411），需要较长的页间和块间延迟。
+    """
 
     name = "youdao"
     URL = "https://aidemo.youdao.com/trans"
     _TO = {"zh-CN": "zh-CHS", "zh-TW": "zh-CHT", "en": "en"}
+    inter_page_delay: float = 5.0    # 页间至少 5 秒，否则容易触发 411
+    inter_chunk_delay: float = 3.0   # 块间至少 3 秒
 
     def __init__(self, target_lang: str = "zh-CN", source_lang: str = "ja",
                  timeout: float = 25.0) -> None:
@@ -220,7 +245,8 @@ class YoudaoTranslator(BaseTranslator):
 
     def translate(self, texts: Sequence[str]) -> List[str]:
         results: List[str] = []
-        for chunk in _chunked(list(texts), max_items=10, max_chars=900):
+        chunks = list(_chunked(list(texts), max_items=10, max_chars=900))
+        for i, chunk in enumerate(chunks):
             params = urllib.parse.urlencode(
                 {"q": "\n".join(chunk), "from": self.source_lang,
                  "to": self._TO.get(self.target_lang, "zh-CHS")}
@@ -232,6 +258,8 @@ class YoudaoTranslator(BaseTranslator):
             if len(parts) != len(chunk):
                 parts = [self._translate_one(text) for text in chunk]
             results.extend(parts)
+            if i < len(chunks) - 1:
+                self._chunk_sleep()
         return results
 
     def _translate_one(self, text: str) -> str:
@@ -249,6 +277,8 @@ class MyMemoryTranslator(BaseTranslator):
 
     name = "mymemory"
     URL = "https://api.mymemory.translated.net/get"
+    inter_page_delay: float = 1.5
+    inter_chunk_delay: float = 1.0
 
     def __init__(self, target_lang: str = "zh-CN", source_lang: str = "ja",
                  timeout: float = 25.0) -> None:
