@@ -427,6 +427,15 @@ class MainWindow(QMainWindow):
             paste.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
             paste.activated.connect(self.import_from_clipboard)
 
+        # Up / Down arrows switch pages when the canvas has focus.
+        # These are intentionally canvas-scoped so they never steal keystrokes from
+        # the proofreading text boxes on the right.
+        for key, method in ((Qt.Key.Key_Up, self.previous_page),
+                             (Qt.Key.Key_Down, self.next_page)):
+            sc = QShortcut(QKeySequence(key), self.canvas)
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc.activated.connect(method)
+
         self.splitter.addWidget(left)
         self.splitter.addWidget(centre)
         self.splitter.addWidget(right)

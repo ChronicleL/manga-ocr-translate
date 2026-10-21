@@ -18,6 +18,7 @@ import gc
 import itertools
 import queue
 import threading
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Set, Tuple
@@ -138,6 +139,7 @@ class TranslationWorker:
             return generation == self._generation
 
     def _run(self) -> None:
+        _last_translated_at: float = 0.0   # monotonic timestamp of the last completed job
         while True:
             job = self._jobs.get()
             if job is None:
@@ -145,6 +147,21 @@ class TranslationWorker:
             generation, job_id, page_id, items, translator = job
             if not self._current(generation):
                 continue
+            # Throttle consecutive page requests to avoid rate-limiting by web APIs.
+            # Only sleep when there was a previous job from the same generation.
+            delay = getattr(translator, "inter_page_delay", 0.0)
+            if delay > 0 and _last_translated_at > 0:
+                elapsed = time.monotonic() - _last_translated_at
+                remaining = delay - elapsed
+                if remaining > 0:
+                    # Check generation periodically so a cancel wakes up quickly.
+                    deadline = time.monotonic() + remaining
+                    while time.monotonic() < deadline:
+                        if not self._current(generation):
+                            break
+                        time.sleep(min(0.2, deadline - time.monotonic()))
+                    if not self._current(generation):
+                        continue
             try:
                 sources = [source for _index, source in items]
                 outputs = list(translator.translate(sources))
@@ -157,7 +174,9 @@ class TranslationWorker:
                     # let the next queued request go out first (same cause, e.g. a bad API key).
                     self.cancel_all()
                     self.signals.failed.emit(job_id, page_id, str(exc) or type(exc).__name__)
+                _last_translated_at = time.monotonic()
                 continue
+            _last_translated_at = time.monotonic()
             if self._current(generation):
                 result = [(index, source, str(text).strip())
                           for (index, source), text in zip(items, outputs)]

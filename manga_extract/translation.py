@@ -136,6 +136,10 @@ class BaseTranslator:
     """Translate a list of strings, preserving order."""
 
     name = "base"
+    # Seconds to sleep between consecutive page-level jobs when translating
+    # multiple pages at once.  Web engines need this to avoid rate-limiting;
+    # AI engines are already slow enough that no extra delay is required.
+    inter_page_delay: float = 2.0
 
     def __init__(self, target_lang: str = "zh-CN", timeout: float = 25.0) -> None:
         self.target_lang = target_lang
@@ -287,6 +291,7 @@ class AITranslator(BaseTranslator):
     """Any OpenAI-compatible ``/chat/completions`` endpoint."""
 
     name = "ai"
+    inter_page_delay: float = 0.5   # AI calls are already slow; only a minimal pause needed
 
     # Assembled from three parts so a user-supplied style requirement lands
     # *before* the output-format rules instead of trailing them: instructions

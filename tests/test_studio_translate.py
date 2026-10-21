@@ -561,3 +561,76 @@ class OverlayFromEditsTests(StudioFlowBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InterPageDelayTests(unittest.TestCase):
+    """翻译限速：web translator 在页面之间应该有延迟；AI 延迟更短；取消时不等待。"""
+
+    def test_web_translators_have_default_inter_page_delay(self):
+        from manga_extract.translation import (
+            GoogleTranslator, YoudaoTranslator, MyMemoryTranslator, AITranslator, AIConfig
+        )
+        for cls in (GoogleTranslator, YoudaoTranslator, MyMemoryTranslator):
+            t = cls()
+            self.assertGreaterEqual(t.inter_page_delay, 1.5, f"{cls.__name__} delay too short")
+        ai = AITranslator(AIConfig())
+        self.assertLess(ai.inter_page_delay, 1.0, "AI delay should be shorter than web")
+
+    def test_translation_worker_sleeps_between_jobs(self):
+        """两页之间至少等待 inter_page_delay 时间。"""
+        import time, threading
+        from manga_extract.studio.workers import TranslationWorker
+
+        call_times = []
+        both_done = threading.Event()
+
+        class QuickTranslator:
+            inter_page_delay = 0.4   # 短一点让测试快
+
+            def translate(self, texts):
+                call_times.append(time.monotonic())
+                if len(call_times) >= 2:
+                    both_done.set()
+                return [f"ok:{t}" for t in texts]
+
+        worker = TranslationWorker()
+        t = QuickTranslator()
+        worker.submit(1, "p1", [(0, "a")], t)
+        worker.submit(2, "p2", [(0, "b")], t)
+
+        both_done.wait(timeout=4.0)
+        self.assertEqual(len(call_times), 2, "Both jobs should run")
+        self.assertGreaterEqual(call_times[1] - call_times[0], 0.3,
+                                "Second job should wait inter_page_delay")
+        worker.stop()
+
+    def test_cancel_during_delay_skips_pending_jobs(self):
+        """取消时正在等待延迟的任务应立即跳过，不等延迟结束。"""
+        import time, threading
+        from manga_extract.studio.workers import TranslationWorker
+
+        calls = []
+        first_done = threading.Event()
+
+        class SlowTranslator:
+            inter_page_delay = 1.5
+
+            def translate(self, texts):
+                calls.append(list(texts))
+                first_done.set()
+                return [f"ok:{t}" for t in texts]
+
+        worker = TranslationWorker()
+        t = SlowTranslator()
+        worker.submit(1, "p1", [(0, "a")], t)
+        worker.submit(2, "p2", [(0, "b")], t)
+
+        first_done.wait(timeout=2.0)
+        self.assertEqual(len(calls), 1, "First job should have run")
+        worker.cancel_all()   # second job is in the delay window
+
+        time.sleep(2.0)       # longer than remaining delay
+        self.assertEqual(len(calls), 1, "Second job should have been cancelled")
+        worker.stop()
+
+
