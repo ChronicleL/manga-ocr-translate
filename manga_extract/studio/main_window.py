@@ -1426,16 +1426,17 @@ class MainWindow(QMainWindow):
             self.translator.submit(job_id, page_id, items, translator)
         self._update_translation_ui()
 
-    def _update_translation_ui(self) -> None:
+    def _update_translation_ui(self, completed_note: str = "") -> None:
         done, total = self._translate_done, self._translate_total
         self.canvas.bar.set_translating(True, f"翻译中 {done}/{total}")
-        self.set_status(f"翻译中… 已完成 {done}/{total} 页")
+        self.set_status(f"翻译中… 已完成 {done}/{total} 页{completed_note}")
 
     def _finish_translation_ui(self) -> None:
         self._translate_total = self._translate_done = 0
         self.canvas.bar.set_translating(False)
 
-    def _on_translated(self, job_id: int, page_id: str, items: list) -> None:
+    def _on_translated(self, job_id: int, page_id: str, items: list,
+                       api_request_count: Optional[int] = None) -> None:
         job = self._translate_jobs.pop(job_id, None)
         if job is None or self.project is None:
             return                          # cancelled, or from a project that was closed
@@ -1455,14 +1456,18 @@ class MainWindow(QMainWindow):
         if changed:
             self.page_data_changed(page_id)
         self._translate_done += 1
+        request_note = (f"；刚完成页面 {page_id}，AI API 请求 {api_request_count} 次"
+                        if api_request_count is not None else "")
         if self._translate_jobs:
-            self._update_translation_ui()
+            self._update_translation_ui(request_note)
         else:
             total = self._translate_total
             self._finish_translation_ui()
-            self.set_status(f"翻译完成：{total} 页，更新了 {self._translate_applied} 个文本块")
+            self.set_status(
+                f"翻译完成：{total} 页，更新了 {self._translate_applied} 个文本块{request_note}")
 
-    def _on_translation_failed(self, job_id: int, page_id: str, message: str) -> None:
+    def _on_translation_failed(self, job_id: int, page_id: str, message: str,
+                               api_request_count: Optional[int] = None) -> None:
         if job_id not in self._translate_jobs:
             return
         done, total = self._translate_done, self._translate_total
@@ -1470,9 +1475,12 @@ class MainWindow(QMainWindow):
         self._translate_jobs.clear()
         self._finish_translation_ui()
         progress = f"（已完成 {done}/{total} 页）" if done else ""
-        self._error("翻译失败", f"{message.splitlines()[0] if message else '未知错误'}{progress}",
+        request_note = (f"；页面 {page_id} 已发起 {api_request_count} 次 AI API 请求"
+                        if api_request_count is not None else "")
+        self._error("翻译失败",
+                    f"{message.splitlines()[0] if message else '未知错误'}{progress}{request_note}",
                     duration=10000)
-        self.set_status("翻译已中断")
+        self.set_status(f"翻译已中断{request_note}")
 
     def cancel_translation(self) -> None:
         if not self._translate_jobs:

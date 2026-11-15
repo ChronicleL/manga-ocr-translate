@@ -14,6 +14,8 @@ id was reused by a newer import) never receives a stale result.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import gc
 import itertools
 import queue
@@ -99,24 +101,29 @@ def default_image_reader(path: str) -> Any:
 
 
 class TranslationSignals(QObject):
-    translated = Signal(int, str, object)   # job id, page id, [(block index, source, translation)]
-    failed = Signal(int, str, str)          # job id, page id, message
+    translated = Signal(int, str, object, object)  # job id, page id, results, API request count
+    failed = Signal(int, str, str, object)         # job id, page id, message, API request count
 
 
 class TranslationWorker:
-    """Runs translation requests one at a time on a daemon thread.
+    """Runs translation requests on daemon threads.
+
+    Supports concurrent execution for translators with ``max_concurrency > 1``
+    (such as OpenAI/DeepSeek API backends) while preserving serial throttling with
+    ``inter_page_delay`` for rate-limited web translators (Google/Youdao/MyMemory).
 
     A network call cannot be interrupted, so cancelling just bumps a generation
-    counter: jobs queued under an older generation are skipped and a running
-    one is not reported. (Daemon: a slow request never delays closing the app.)
+    counter: jobs queued under an older generation are skipped and running ones
+    are discarded. (Daemon: a slow request never delays closing the app.)
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_pool_workers: int = 4) -> None:
         self.signals = TranslationSignals()
         self._jobs: "queue.Queue[Optional[tuple]]" = queue.Queue()
         self._lock = threading.Lock()
         self._generation = 0
         self._thread: Optional[threading.Thread] = None
+        self._pool = ThreadPoolExecutor(max_workers=max(1, max_pool_workers), thread_name_prefix="translate-pool")
 
     def submit(self, job_id: int, page_id: str, items: list, translator: Any) -> None:
         """``items`` is ``[(block index, source text)]``; ``translator`` is built by the caller."""
@@ -143,44 +150,68 @@ class TranslationWorker:
         while True:
             job = self._jobs.get()
             if job is None:
+                self._pool.shutdown(wait=False, cancel_futures=True)
                 return
             generation, job_id, page_id, items, translator = job
             if not self._current(generation):
                 continue
-            # Throttle consecutive page requests to avoid rate-limiting by web APIs.
-            # Only sleep when there was a previous job from the same generation.
-            delay = getattr(translator, "inter_page_delay", 0.0)
-            if delay > 0 and _last_translated_at > 0:
-                elapsed = time.monotonic() - _last_translated_at
-                remaining = delay - elapsed
-                if remaining > 0:
-                    # Check generation periodically so a cancel wakes up quickly.
-                    deadline = time.monotonic() + remaining
-                    while time.monotonic() < deadline:
+
+            concurrency = max(1, getattr(translator, "max_concurrency", 1))
+            if concurrency > 1:
+                # Concurrent mode (e.g. AI API): submit to thread pool for parallel execution across pages
+                self._pool.submit(self._execute_job, generation, job_id, page_id, items, translator)
+            else:
+                # Serial throttled mode (e.g. free web APIs or simulated test backends)
+                delay = getattr(translator, "inter_page_delay", 0.0)
+                if delay > 0 and _last_translated_at > 0:
+                    elapsed = time.monotonic() - _last_translated_at
+                    remaining = delay - elapsed
+                    if remaining > 0:
+                        deadline = time.monotonic() + remaining
+                        while time.monotonic() < deadline:
+                            if not self._current(generation):
+                                break
+                            time.sleep(min(0.2, deadline - time.monotonic()))
                         if not self._current(generation):
-                            break
-                        time.sleep(min(0.2, deadline - time.monotonic()))
-                    if not self._current(generation):
-                        continue
-            try:
-                sources = [source for _index, source in items]
-                outputs = list(translator.translate(sources))
-                if len(outputs) != len(sources):
-                    raise RuntimeError(
-                        f"译文数量（{len(outputs)}）与原文（{len(sources)}）不一致")
-            except Exception as exc:  # noqa: BLE001 - reported to the user
-                if self._current(generation):
-                    # Drop the rest of this batch right here: waiting for the GUI to react would
-                    # let the next queued request go out first (same cause, e.g. a bad API key).
-                    self.cancel_all()
-                    self.signals.failed.emit(job_id, page_id, str(exc) or type(exc).__name__)
+                            continue
+                self._execute_job(generation, job_id, page_id, items, translator)
                 _last_translated_at = time.monotonic()
-                continue
-            _last_translated_at = time.monotonic()
+
+    def _execute_job(self, generation: int, job_id: int, page_id: str,
+                     items: list, translator: Any) -> None:
+        if not self._current(generation):
+            return
+        request_count_before = getattr(translator, "api_request_count", None)
+        try:
+            sources = [source for _index, source in items]
+            outputs = list(translator.translate(sources))
+            if len(outputs) != len(sources):
+                raise RuntimeError(
+                    f"译文数量（{len(outputs)}）与原文（{len(sources)}）不一致")
+        except Exception as exc:  # noqa: BLE001 - reported to the user
             if self._current(generation):
-                result = [(index, source, str(text).strip())
-                          for (index, source), text in zip(items, outputs)]
-                self.signals.translated.emit(job_id, page_id, result)
+                # Drop the rest of this batch right here
+                self.cancel_all()
+                request_count = self._request_count_delta(translator, request_count_before)
+                self.signals.failed.emit(
+                    job_id, page_id, str(exc) or type(exc).__name__, request_count)
+            return
+
+        if self._current(generation):
+            result = [(index, source, str(text).strip())
+                      for (index, source), text in zip(items, outputs)]
+            request_count = self._request_count_delta(translator, request_count_before)
+            self.signals.translated.emit(job_id, page_id, result, request_count)
+
+    @staticmethod
+    def _request_count_delta(translator: Any, before: Any) -> Optional[int]:
+        thread_cnt = getattr(translator, "thread_request_count", None)
+        if isinstance(thread_cnt, int):
+            return thread_cnt
+        after = getattr(translator, "api_request_count", None)
+        if isinstance(before, int) and isinstance(after, int):
+            return max(0, after - before)
+        return None
 
 
 class EngineSignals(QObject):

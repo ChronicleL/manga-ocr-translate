@@ -189,6 +189,7 @@ class RegionRedetectFlowTests(unittest.TestCase):
     def setUp(self):
         from manga_extract.studio.main_window import MainWindow
         from manga_extract.studio.config import StudioConfig
+        from manga_extract.studio.project import Project
 
         import tempfile
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -209,26 +210,34 @@ class RegionRedetectFlowTests(unittest.TestCase):
 
         extractor.redetect_region = lambda img, xyxy: FakeBlock()
         self.engine = make_engine(extractor)
+        self.addCleanup(self.engine.stop)
 
-        self.window = MainWindow(StudioConfig(), engine=self.engine)
+        self.window = MainWindow(StudioConfig(auto_recognize=False), engine=self.engine)
+        self.addCleanup(self.window.overlay.shutdown)
+        self.addCleanup(self.window.translator.stop)
         self.window.show()
         pump(self.app, 20)
         self.addCleanup(dispose_window, self.app, self.window)
+        self.window.project = Project.create(Path(self.tmpdir.name) / "project")
+        self.window._enter_project()
 
     def _open_page(self):
-        """Import one fake page and wait for recognition."""
+        """Import one fake page and prepare its OCR data."""
         from _studio_fakes import fake_result
         from manga_extract.studio.project import PageData
 
         self.engine.signals.loaded.emit("fake")
         w = self.window
         # Create a real temp image
-        import numpy as np, cv2, uuid
+        from PySide6.QtGui import QImage
+        import uuid
         img_path = Path(self.tmpdir.name) / f"{uuid.uuid4().hex}.png"
-        cv2.imwrite(str(img_path), np.ones((200, 200, 3), np.uint8) * 200)
-        w.import_images([img_path])
+        image = QImage(200, 200, QImage.Format.Format_RGB32)
+        image.fill(0xFFCCCCCC)
+        self.assertTrue(image.save(str(img_path)))
+        w.import_paths([str(img_path)])
         pump(self.app, 20)
-        page_id = list(w._data.keys())[0] if w._data else None
+        page_id = w.project.pages[0].id if w.project and w.project.pages else None
         if page_id:
             data = PageData.from_result(fake_result())
             w._data[page_id] = data
@@ -238,22 +247,23 @@ class RegionRedetectFlowTests(unittest.TestCase):
 
     def test_redetect_request_adds_to_region_jobs(self):
         page_id = self._open_page()
-        if page_id is None:
-            self.skipTest("page not created")
+        self.assertIsNotNone(page_id)
         self.window._engine_ready = True
-        pump(self.app)
-        n_before = len(self.window._region_jobs)
-        self.window.canvas.view.blockRedetectRequested.emit(0)
-        pump(self.app, 5)
-        # Either the job was submitted or already completed (engine is fast)
-        # Either way, no unhandled error
-        self.assertGreaterEqual(len(self.window._region_jobs) + 1, n_before + 1 - 1)
+        from unittest.mock import patch
+        with patch.object(self.engine, "submit_region") as submit_region:
+            self.window.canvas.view.blockRedetectRequested.emit(0)
+
+        self.assertEqual(len(self.window._region_jobs), 1)
+        req_id, job = next(iter(self.window._region_jobs.items()))
+        bbox = tuple(self.window._data[page_id].blocks[0].bbox)
+        self.assertEqual(job, (page_id, 0, bbox))
+        submit_region.assert_called_once_with(
+            page_id, str(self.window.project.image_path(page_id)), list(bbox), req_id)
 
     def test_redetect_stale_result_is_ignored(self):
         """If the bbox changed after submitting, the result must be silently dropped."""
         page_id = self._open_page()
-        if page_id is None:
-            self.skipTest("page not created")
+        self.assertIsNotNone(page_id)
         data = self.window._data[page_id]
         old_bbox = tuple(data.blocks[0].bbox)
         # Pretend we submitted a job
@@ -272,6 +282,7 @@ class RegionRedetectFlowTests(unittest.TestCase):
         self.window._on_region_recognized(page_id, req_id, fake_block)
         pump(self.app, 5)
         self.assertEqual(data.blocks[0].source, old_source)   # not overwritten
+        self.assertNotIn(req_id, self.window._region_jobs)
 
 
 if __name__ == "__main__":

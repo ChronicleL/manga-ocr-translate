@@ -129,6 +129,22 @@ class TranslationFlowTests(StudioFlowBase):
         self.assertIn("翻译完成", window.status_left.text())
         self.assertFalse(window.canvas.bar._busy)
 
+    def test_completed_ai_page_shows_its_api_request_count(self):
+        class CountingTranslator:
+            api_request_count = 0
+
+            def translate(self, texts):
+                self.api_request_count += 3
+                return [f"译:{text}" for text in texts]
+
+        translator = CountingTranslator()
+        window = self.make_window(translator=translator)
+        window.translate_current()
+
+        self.assertTrue(wait_until(
+            self.app, lambda: "AI API 请求 3 次" in window.status_left.text()))
+        self.assertIn("翻译完成", window.status_left.text())
+
     def test_reviewed_and_hand_edited_translations_are_left_alone(self):
         window = self.make_window()
         self.data().blocks[0].reviewed = True
@@ -563,6 +579,37 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class AIRequestCountTests(unittest.TestCase):
+    def test_count_includes_batch_request_and_per_text_fallback_requests(self):
+        from unittest.mock import patch
+        from manga_extract.translation import AIConfig, AITranslator
+
+        def fake_post(_url, payload, _headers, _timeout):
+            items = json.loads(payload["messages"][1]["content"])
+            outputs = ["数量不匹配"] if len(items) > 1 else [f"译:{items[0]}"]
+            return {"choices": [{"message": {"content": json.dumps(outputs, ensure_ascii=False)}}]}
+
+        translator = AITranslator(AIConfig())
+        with patch("manga_extract.translation._http_post_json", side_effect=fake_post) as post:
+            self.assertEqual(translator.translate(["第一句", "第二句"]),
+                             ["译:第一句", "译:第二句"])
+
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(translator.api_request_count, 3)
+
+    def test_failed_http_attempt_is_still_counted(self):
+        from unittest.mock import patch
+        from manga_extract.translation import AIConfig, AITranslator
+
+        translator = AITranslator(AIConfig())
+        with patch("manga_extract.translation._http_post_json",
+                   side_effect=OSError("network unavailable")):
+            with self.assertRaises(OSError):
+                translator.translate(["一句"])
+
+        self.assertEqual(translator.api_request_count, 1)
+
+
 class InterPageDelayTests(unittest.TestCase):
     """翻译限速：web translator 在页面之间应该有延迟；AI 延迟更短；取消时不等待。"""
 
@@ -632,5 +679,4 @@ class InterPageDelayTests(unittest.TestCase):
         time.sleep(2.0)       # longer than remaining delay
         self.assertEqual(len(calls), 1, "Second job should have been cancelled")
         worker.stop()
-
 

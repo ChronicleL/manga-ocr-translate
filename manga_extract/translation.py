@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -295,6 +296,10 @@ class MyMemoryTranslator(BaseTranslator):
         return str(data.get("responseData", {}).get("translatedText", ""))
 
 
+_NO_JSON_FORMAT_URLS: set[str] = set()
+_NO_REASONING_EFFORT_URLS: set[str] = set()
+
+
 @dataclass
 class AIConfig:
     """One OpenAI-compatible endpoint preset ("一套 API").
@@ -315,13 +320,14 @@ class AIConfig:
     name: str = "默认"
     prompt: str = ""
     disable_thinking: bool = False
+    max_concurrency: int = 3
 
 
 class AITranslator(BaseTranslator):
     """Any OpenAI-compatible ``/chat/completions`` endpoint."""
 
     name = "ai"
-    inter_page_delay: float = 0.5   # AI calls are already slow; only a minimal pause needed
+    inter_page_delay: float = 0.0   # Commercial AI endpoints need no delay
 
     # Assembled from three parts so a user-supplied style requirement lands
     # *before* the output-format rules instead of trailing them: instructions
@@ -334,20 +340,46 @@ class AITranslator(BaseTranslator):
         super().__init__(target_lang=target_lang, timeout=config.timeout)
         self.config = config
         self.source_lang = source_lang
+        self.max_concurrency = max(1, getattr(config, "max_concurrency", 3))
+        self._api_request_count = 0
+        self._api_request_count_lock = threading.Lock()
+        self._thread_local = threading.local()
+
+    @property
+    def thread_request_count(self) -> Optional[int]:
+        """Request count for the current thread during its latest translation job."""
+        return getattr(self._thread_local, "request_count", None)
+
+    @property
+    def api_request_count(self) -> int:
+        """Number of AI HTTP request attempts made by this translator instance."""
+        with self._api_request_count_lock:
+            return self._api_request_count
 
     def system_prompt(self) -> str:
         """Built-in role/format rules with the user's style requirement inside."""
         src_name = self._LANG_NAMES.get(self.source_lang, self.source_lang)
-        head = f"你是资深的{src_name}漫画翻译。\n\n【风格要求（优先于默认语气，必须严格遵守）】\n"
+        head = (
+            f"你是资深的{src_name}漫画翻译与本地化专家。\n\n"
+            "【上下文连贯与气泡拆分规则】\n"
+            f"用户输入的是按漫画阅读顺序排布的 JSON 字符串数组，来自同一页中的各个对白气泡。\n"
+            "1. 连续的条目往往是【同一个完整长句】被分镜气泡拆分后的片段。请务必通读前后所有条目，"
+            "结合整页语境理清主谓宾关系、说话人身份及情感语境（如内疚、自责、情绪起伏等），切勿孤立割裂理解；\n"
+            "2. 保持条目数量与顺序完全一致。即使某个条目只是半句话，也请将其翻译为对应的半句自然译文，"
+            "严禁合并或丢弃条目；\n"
+            "3. 若条目中遇到开头的冒号‘：’或多余句点，通常是竖排省略号的 OCR 误识别，请按省略号停顿理解并还原为‘……’；\n\n"
+            "【风格要求（优先于默认语气，必须严格遵守）】\n"
+        )
         tail = (
             "\n\n【输出格式】\n"
-            f"把用户给出的每一条{src_name}按上面的风格翻译成简体中文，保持条目数量与顺序完全不变，"
-            "不要合并或拆分条目，不要加解释。只输出一个 JSON 字符串数组，每个元素对应一条译文。"
+            f"把用户给出的每一条{src_name}按上面的要求翻译成简体中文，保持条目数量与顺序完全不变，"
+            "不要合并或拆分条目，不要加解释。只输出一个标准的 JSON 字符串数组，每个元素对应一条译文。"
         )
         style = (self.config.prompt or "").strip() or self.DEFAULT_STYLE
         return f"{head}{style}{tail}"
 
     def translate(self, texts: Sequence[str]) -> List[str]:
+        self._thread_local.request_count = 0
         items = list(texts)
         if not items:
             return []
@@ -364,24 +396,51 @@ class AITranslator(BaseTranslator):
             return list(pool.map(self._single, items))
 
     def _chat(self, items: List[str]) -> str:
-        payload = {
-            "model": self.config.model,
-            "temperature": self.config.temperature,
-            "messages": [
-                {"role": "system", "content": self.system_prompt()},
-                {"role": "user", "content": json.dumps(items, ensure_ascii=False)},
-            ],
-        }
-        if self.config.disable_thinking:
-            payload["enable_thinking"] = False
         url = self.config.base_url.rstrip("/") + "/chat/completions"
         headers = {"Authorization": f"Bearer {self.config.api_key}"} if self.config.api_key else {}
-        # Parsed JSON from the endpoint: shape is checked by the try/except below.
-        data: Any = _http_post_json(url, payload, headers, self.timeout)
-        try:
-            return str(data["choices"][0]["message"]["content"])
-        except (KeyError, IndexError, TypeError) as exc:
-            raise TranslationError(f"AI 返回了意外的数据：{str(data)[:300]}") from exc
+        use_json_format = url not in _NO_JSON_FORMAT_URLS
+        use_reasoning_effort = self.config.disable_thinking and (url not in _NO_REASONING_EFFORT_URLS)
+
+        for attempt in range(2):
+            payload: dict = {
+                "model": self.config.model,
+                "temperature": self.config.temperature,
+                "messages": [
+                    {"role": "system", "content": self.system_prompt()},
+                    {"role": "user", "content": json.dumps(items, ensure_ascii=False)},
+                ],
+            }
+            if use_json_format:
+                payload["response_format"] = {"type": "json_object"}
+            if self.config.disable_thinking:
+                payload["enable_thinking"] = False
+                if use_reasoning_effort:
+                    payload["reasoning_effort"] = "none"
+
+            with self._api_request_count_lock:
+                self._api_request_count += 1
+            self._thread_local.request_count = getattr(self._thread_local, "request_count", 0) + 1
+
+            try:
+                data: Any = _http_post_json(url, payload, headers, self.timeout)
+                return str(data["choices"][0]["message"]["content"])
+            except TranslationError as exc:
+                err_msg = str(exc).lower()
+                changed = False
+                if use_json_format and ("response_format" in err_msg or "structured" in err_msg):
+                    use_json_format = False
+                    _NO_JSON_FORMAT_URLS.add(url)
+                    changed = True
+                if use_reasoning_effort and ("reasoning_effort" in err_msg):
+                    use_reasoning_effort = False
+                    _NO_REASONING_EFFORT_URLS.add(url)
+                    changed = True
+                if changed and attempt == 0:
+                    continue
+                raise
+            except (KeyError, IndexError, TypeError) as exc:
+                raise TranslationError(f"AI 返回了意外的数据：{str(data)[:300]}") from exc
+        raise TranslationError("重试后依然无法获取翻译结果")
 
     def _request(self, items: List[str]) -> List[str]:
         return _parse_json_array(self._chat(items))
@@ -398,12 +457,43 @@ def _parse_json_array(content: str) -> List[str]:
     text = re.sub(r"\s*```$", "", text)
     start, end = text.find("["), text.rfind("]")
     if start != -1 and end > start:
+        snippet = text[start : end + 1]
         try:
-            parsed = json.loads(text[start : end + 1])
+            parsed = json.loads(snippet)
             if isinstance(parsed, list):
                 return [str(item).strip() for item in parsed]
         except json.JSONDecodeError:
-            pass
+            # 容错：去除数组尾部多余逗号重试，例如 ["a", "b",]
+            fixed = re.sub(r",\s*\]", "]", snippet)
+            try:
+                parsed = json.loads(fixed)
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed]
+            except json.JSONDecodeError:
+                pass
+
+    # 容错：模型返回字典结构（如 {"translations": [...]} 或 {"0": "...", "1": "..."}）
+    dict_start, dict_end = text.find("{"), text.rfind("}")
+    if dict_start != -1 and dict_end > dict_start:
+        snippet = text[dict_start : dict_end + 1]
+        try:
+            parsed_dict = json.loads(snippet)
+        except json.JSONDecodeError:
+            fixed = re.sub(r",\s*\}", "}", snippet)
+            try:
+                parsed_dict = json.loads(fixed)
+            except json.JSONDecodeError:
+                parsed_dict = None
+        if isinstance(parsed_dict, dict):
+            for v in parsed_dict.values():
+                if isinstance(v, list):
+                    return [str(item).strip() for item in v]
+            def _sort_key(k: Any):
+                nums = re.findall(r"\d+", str(k))
+                return int(nums[0]) if nums else str(k)
+            sorted_items = sorted(parsed_dict.items(), key=lambda kv: _sort_key(kv[0]))
+            return [str(v).strip() for _, v in sorted_items]
+
     lines = [re.sub(r"^\s*\d+\s*[.、)]\s*", "", ln).strip() for ln in text.splitlines()]
     return [ln for ln in lines if ln]
 

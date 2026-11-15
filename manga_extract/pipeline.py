@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -14,6 +16,30 @@ from .reading_order import TextBlock, group_text_lines
 
 # Sentinel key for the catch-all / primary recognizer in the dict.
 _DEFAULT_LANG = "default"
+
+
+def clean_ocr_text(text: str) -> str:
+    """Clean up common OCR artifacts in manga speech bubbles.
+
+    - Vertical ellipsis (… / ⋯) is frequently misrecognized as colons (： or :)
+      at the beginning or end of lines.
+    - Stray punctuation or noise around speech bubble boundaries.
+    """
+    if not text:
+        return ""
+    cleaned = text.strip()
+    # 句首误识别的冒号转换为省略号 (例如 "：ごめん" -> "…ごめん")
+    if cleaned.startswith(("：", ":")):
+        cleaned = re.sub(r"^[：:]+", "…", cleaned)
+    # 句末误识别的冒号转换为省略号 (例如 "そんな：" -> "そんな…")
+    if cleaned.endswith(("：", ":")):
+        cleaned = re.sub(r"[：:]+$", "…", cleaned)
+    # 孤立全半角冒号
+    if cleaned in (":", "："):
+        cleaned = "…"
+    # 清洗句首的多余逗号或顿号噪点 (例如 "、佐々木さんに" -> "佐々木さんに")
+    cleaned = re.sub(r"^[、，,\s]+", "", cleaned)
+    return cleaned
 
 
 @dataclass
@@ -38,7 +64,7 @@ class ExtractedBlock:
 
     @property
     def text(self) -> str:
-        return "".join(line.text for line in self.lines)
+        return clean_ocr_text("".join(line.text for line in self.lines))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -231,7 +257,7 @@ class MangaExtractor:
                 ocr_cb = _progress if on_progress else None
                 texts = _recognize_all(rec, crops_for_rec, on_progress=ocr_cb)
                 for (block_index, line_index, _), text in zip(slot_list, texts):
-                    result_blocks[block_index].lines[line_index].text = text
+                    result_blocks[block_index].lines[line_index].text = clean_ocr_text(text)
 
         return PageResult(
             source=source,
@@ -302,7 +328,7 @@ class MangaExtractor:
                 for poly, text in zip(line_polys, texts):
                     extracted.lines.append(ExtractedLine(
                         polygon=poly,
-                        text=text,
+                        text=clean_ocr_text(text),
                     ))
 
         return extracted

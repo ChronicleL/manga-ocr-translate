@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QIntValidator
-from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QVBoxLayout, QWidget
+from PySide6.QtGui import QFont, QFontDatabase, QIntValidator
+from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
@@ -265,12 +265,46 @@ class SettingsDialog(QDialog):
         self.scale_box.addItems([f"{round(v * 100)}%" for v in FONT_SCALE_CHOICES])
         nearest = min(FONT_SCALE_CHOICES, key=lambda v: abs(v - font_scale))
         self.scale_box.setCurrentIndex(FONT_SCALE_CHOICES.index(nearest))
+        self.font_preview = QLabel("漫画文字 Aa 123", frame)
+        self.font_preview.setObjectName("fontPreview")
+        self.font_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.font_preview.setMinimumSize(180, 44)
+        self._preview_font_families = {}
+        self.font_box.currentIndexChanged.connect(self._update_font_preview)
+        self.scale_box.currentIndexChanged.connect(self._update_font_preview)
+        self._update_font_preview()
         hint = CaptionLabel("字号倍率缩放自动字号的上限；单个文本块的字号可在右侧校对卡片里单独指定。", frame)
         hint.setWordWrap(True)
         box.addLayout(self._row("字体", self.font_box))
-        box.addLayout(self._row("字号倍率", self.scale_box, stretch=-1))
+        box.addLayout(self._row("字号倍率", self.scale_box, self.font_preview, stretch=0))
         box.addWidget(hint)
         return frame
+
+    def _update_font_preview(self, _index: int = -1) -> None:
+        from ..typeset import find_cjk_font
+
+        font_path = self._font_paths[self.font_box.currentIndex()]
+        if not font_path:
+            default_font = find_cjk_font()
+            font_path = default_font[0] if default_font else ""
+
+        font = QFont()
+        if font_path:
+            if font_path not in self._preview_font_families:
+                font_id = QFontDatabase.addApplicationFont(font_path)
+                families = QFontDatabase.applicationFontFamilies(font_id) if font_id >= 0 else []
+                self._preview_font_families[font_path] = families[0] if families else ""
+            family = self._preview_font_families[font_path]
+            if family:
+                font = QFont(family)
+
+        scale = FONT_SCALE_CHOICES[self.scale_box.currentIndex()]
+        preview_size = round(24 * scale)
+        font.setPixelSize(preview_size)
+        self.font_preview.setFont(font)
+        self.font_preview.setToolTip(
+            f"{font.family()} · 示例字号 {preview_size}px（24px × {round(scale * 100)}%；"
+            "实际排版字号会按文本框自动适配）")
 
     _LANG_LABELS = {"ja": "日文", "ko": "韩文"}
     _LANG_CODES  = {"日文": "ja", "韩文": "ko"}
@@ -344,9 +378,13 @@ class SettingsDialog(QDialog):
         dark = isDarkTheme()
         card = "#2b2b2b" if dark else "#ffffff"
         border = "rgba(255,255,255,0.10)" if dark else "rgba(0,0,0,0.10)"
+        preview_bg = "#202020" if dark else "#f5f5f5"
+        preview_color = "#f3f3f3" if dark else "#242424"
         self.setStyleSheet(
             f"SettingsDialog {{ background: {BG_DARK if dark else BG_LIGHT}; }}"
-            f"#settingsCard {{ background: {card}; border: 1px solid {border}; border-radius: 8px; }}")
+            f"#settingsCard {{ background: {card}; border: 1px solid {border}; border-radius: 8px; }}"
+            f"#fontPreview {{ background: {preview_bg}; color: {preview_color}; "
+            f"border: 1px solid {border}; border-radius: 4px; padding: 2px 6px; }}")
 
     # -- AI profiles ------------------------------------------------------------
     def _active_index(self) -> int:

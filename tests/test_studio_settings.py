@@ -48,16 +48,44 @@ class SettingsBase(unittest.TestCase):
 
         return EngineConfig(**kw)
 
-    def dialog(self, config=None, engine=None, devices=("auto", "cpu", "dml"), builder=None):
+    def dialog(self, config=None, engine=None, devices=("auto", "cpu", "dml"), builder=None,
+               style=None):
         from manga_extract.studio.settings_dialog import SettingsDialog
 
         self.original = config or self.translation_config()
         dlg = SettingsDialog(None, self.original, engine or self.engine_config(), list(devices),
-                             translator_builder=builder)
+                             translator_builder=builder, style=style)
         dlg.show()
         self.addCleanup(dispose_widget, self.app, dlg)
         self.app.processEvents()
         return dlg
+
+
+class TypesetPreviewTests(SettingsBase):
+    def test_font_preview_updates_family_and_size(self):
+        from PySide6.QtGui import QFontDatabase
+
+        fonts = [
+            ("Example Sans Regular", r"C:\fonts\example-sans.ttf"),
+            ("Example Serif Regular", r"C:\fonts\example-serif.ttf"),
+        ]
+        with (
+            mock.patch("manga_extract.typeset.list_system_fonts", return_value=fonts),
+            mock.patch.object(QFontDatabase, "addApplicationFont", side_effect=[11, 12]),
+            mock.patch.object(QFontDatabase, "applicationFontFamilies",
+                              side_effect=[["Example Sans"], ["Example Serif"]]),
+        ):
+            dlg = self.dialog(style=(fonts[0][1], 1.0))
+            self.assertEqual(dlg.font_preview.text(), "漫画文字 Aa 123")
+            self.assertEqual(dlg.font_preview.font().family(), "Example Sans")
+            self.assertEqual(dlg.font_preview.font().pixelSize(), 24)
+
+            dlg.scale_box.setCurrentText("200%")
+            self.assertEqual(dlg.font_preview.font().pixelSize(), 48)
+
+            dlg.font_box.setCurrentIndex(2)
+            self.assertEqual(dlg.font_preview.font().family(), "Example Serif")
+            self.assertEqual(dlg.font_preview.font().pixelSize(), 48)
 
 
 class FormTests(SettingsBase):
