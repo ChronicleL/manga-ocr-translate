@@ -39,6 +39,7 @@ from ..runtime import DEVICE_LABELS, MAX_OCR_BATCH, OCR_BATCH_CHOICES, EngineCon
 from ..translation import TARGET_LANGUAGES, WEB_ENGINES, TranslationConfig
 from .settings_text import (
     AI_MODEL_PRESETS,
+    CONCURRENCY_HELP,
     DEVICE_HELP,
     PERF_HELP,
     TEMPERATURE_HELP,
@@ -53,6 +54,8 @@ from .ui_common import BG_DARK, BG_LIGHT
 TranslatorBuilder = Callable[[TranslationConfig], object]
 
 FONT_SCALE_CHOICES = [0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.5, 2.0]
+_CONCURRENCY_CHOICES = [1, 2, 3, 4, 6, 8]
+_CONCURRENCY_LABELS = ["1（逐页串行）", "2", "3（默认）", "4", "6", "8"]
 
 
 def apply_translation_settings(target: TranslationConfig, edited: TranslationConfig) -> None:
@@ -215,6 +218,10 @@ class SettingsDialog(QDialog):
         self._help(self.temp_help, TEMPERATURE_HELP)
         self.thinking_check = CheckBox("关闭思考模式（更快）", frame)
         self._help(self.thinking_check, THINKING_HELP)
+        self.concurrency_box = ComboBox(frame)
+        self.concurrency_box.addItems(_CONCURRENCY_LABELS)
+        self.concurrency_help = TransparentToolButton(FIF.HELP, frame)
+        self._help(self.concurrency_help, CONCURRENCY_HELP)
         self.prompt_edit = TextEdit(frame)
         self.prompt_edit.setAcceptRichText(False)
         self.prompt_edit.setFixedHeight(84)
@@ -232,6 +239,8 @@ class SettingsDialog(QDialog):
         box.addLayout(self._row("API Key", self.key_edit))
         box.addLayout(self._row("模型", self.model_box))
         box.addLayout(self._row("随机性", self.temp_edit, self.temp_help, self.thinking_check,
+                                stretch=-1))
+        box.addLayout(self._row("并发页数", self.concurrency_box, self.concurrency_help,
                                 stretch=-1))
         box.addLayout(self._row("提示词", self.prompt_edit, top=True))
         test_row = QHBoxLayout()
@@ -413,6 +422,10 @@ class SettingsDialog(QDialog):
         self.model_box.setText(profile.model)
         self.temp_edit.setText(str(profile.temperature))
         self.thinking_check.setChecked(profile.disable_thinking)
+        c = profile.max_concurrency
+        self.concurrency_box.setCurrentIndex(
+            _CONCURRENCY_CHOICES.index(c) if c in _CONCURRENCY_CHOICES
+            else _CONCURRENCY_CHOICES.index(3))
         self.prompt_edit.setPlainText(profile.prompt)
         self._loading = False
         self.config.ai = profile
@@ -427,8 +440,9 @@ class SettingsDialog(QDialog):
         profile.api_key = self.key_edit.text().strip()
         profile.model = self.model_box.text().strip()
         profile.temperature = parse_temperature(self.temp_edit.text())
-        profile.prompt = self.prompt_edit.toPlainText().strip()
         profile.disable_thinking = self.thinking_check.isChecked()
+        profile.max_concurrency = _CONCURRENCY_CHOICES[self.concurrency_box.currentIndex()]
+        profile.prompt = self.prompt_edit.toPlainText().strip()
         self.config.ai = profile
 
     def _on_profile_selected(self, index: int) -> None:

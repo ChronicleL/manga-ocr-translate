@@ -117,13 +117,14 @@ class TranslationWorker:
     are discarded. (Daemon: a slow request never delays closing the app.)
     """
 
-    def __init__(self, max_pool_workers: int = 4) -> None:
+    def __init__(self, max_pool_workers: int = 16) -> None:
         self.signals = TranslationSignals()
         self._jobs: "queue.Queue[Optional[tuple]]" = queue.Queue()
         self._lock = threading.Lock()
         self._generation = 0
         self._thread: Optional[threading.Thread] = None
         self._pool = ThreadPoolExecutor(max_workers=max(1, max_pool_workers), thread_name_prefix="translate-pool")
+        self._sems: Dict[int, threading.BoundedSemaphore] = {}
 
     def submit(self, job_id: int, page_id: str, items: list, translator: Any) -> None:
         """``items`` is ``[(block index, source text)]``; ``translator`` is built by the caller."""
@@ -137,6 +138,7 @@ class TranslationWorker:
     def cancel_all(self) -> None:
         with self._lock:
             self._generation += 1
+        self._sems.clear()   # 旧 sem 由池中线程在 finally 里 release，新批次重建
 
     def stop(self) -> None:
         self._jobs.put(None)
@@ -158,8 +160,18 @@ class TranslationWorker:
 
             concurrency = max(1, getattr(translator, "max_concurrency", 1))
             if concurrency > 1:
-                # Concurrent mode (e.g. AI API): submit to thread pool for parallel execution across pages
-                self._pool.submit(self._execute_job, generation, job_id, page_id, items, translator)
+                # 并发模式（AI API）：用 BoundedSemaphore 保证飞行中的任务不超过 max_concurrency。
+                # 每 0.2s 重试一次 acquire，间隙检查 generation 以支持快速取消。
+                sem = self._sems.setdefault(concurrency, threading.BoundedSemaphore(concurrency))
+                while not sem.acquire(timeout=0.2):
+                    if not self._current(generation):
+                        break
+                else:
+                    if self._current(generation):
+                        self._pool.submit(self._execute_job_sem,
+                                          sem, generation, job_id, page_id, items, translator)
+                    else:
+                        sem.release()
             else:
                 # Serial throttled mode (e.g. free web APIs or simulated test backends)
                 delay = getattr(translator, "inter_page_delay", 0.0)
@@ -176,6 +188,14 @@ class TranslationWorker:
                             continue
                 self._execute_job(generation, job_id, page_id, items, translator)
                 _last_translated_at = time.monotonic()
+
+    def _execute_job_sem(self, sem: threading.BoundedSemaphore, generation: int, job_id: int,
+                         page_id: str, items: list, translator: Any) -> None:
+        """并发路径的包装：任务完成后一定释放 sem slot。"""
+        try:
+            self._execute_job(generation, job_id, page_id, items, translator)
+        finally:
+            sem.release()
 
     def _execute_job(self, generation: int, job_id: int, page_id: str,
                      items: list, translator: Any) -> None:
